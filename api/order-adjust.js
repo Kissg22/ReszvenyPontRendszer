@@ -60,18 +60,18 @@ module.exports = async (req, res) => {
   const token    = process.env.SHOPIFY_API_ACCESS_TOKEN;
   const endpoint = `https://${shop}.myshopify.com/admin/api/${process.env.SHOPIFY_API_VERSION}/graphql.json`;
 
-  // 4) Olvassuk ki az order metafieldeket alias-okkal (magyar mezőnevek)
+  // 4) Olvassuk ki az order raktározott értékeket a frissítéskor (magyar mezőnevek)
   const readQuery = `
     query getOrderMeta($id: ID!) {
       order(id: $id) {
-        osszMeta:  metafield(namespace: "custom", key: "osszes_koltes")    { value }
-        shareMeta: metafield(namespace: "custom", key: "order_share")      { value }
-        restMeta:  metafield(namespace: "custom", key: "fennmarado_osszeg") { value }
+        subtotalMeta: metafield(namespace: "custom", key: "subtotal")         { value }
+        shareMeta:    metafield(namespace: "custom", key: "order_share")      { value }
+        remainderMeta:metafield(namespace: "custom", key: "order_remainder") { value }
         customer { id }
       }
     }
   `;
-  let spent = 0, shares = 0, rest = 0, custId;
+  let subtotalStored = 0, shares = 0, remainderStored = 0, custId;
   try {
     const resp = await fetch(endpoint, {
       method: 'POST',
@@ -82,57 +82,52 @@ module.exports = async (req, res) => {
     console.log('📨 Read meta response:', JSON.stringify(json, null, 2));
     if (json.errors && json.errors.length) throw json.errors;
 
-    spent   = parseFloat(json.data.order.osszMeta?.value || '0');
-    shares  = parseInt(json.data.order.shareMeta?.value || '0', 10);
-    rest    = parseFloat(json.data.order.restMeta?.value || '0');
-    custId  = json.data.order.customer.id.split('/').pop();
+    subtotalStored  = parseFloat(json.data.order.subtotalMeta?.value || '0');
+    shares          = parseInt(json.data.order.shareMeta?.value || '0', 10);
+    remainderStored = parseFloat(json.data.order.remainderMeta?.value || '0');
+    custId          = json.data.order.customer.id.split('/').pop();
 
-    console.log('📑 Order meta values:', {
-      spent: spent.toFixed(2),
-      shares,
-      rest: rest.toFixed(2),
-      custId
-    });
+    console.log('📑 Order stored values:', { subtotalStored: subtotalStored.toFixed(2), shares, remainderStored: remainderStored.toFixed(2), custId });
   } catch (e) {
     console.error('❌ Error reading order meta:', e);
     return res.writeHead(500).end('Read meta error');
   }
 
   // 5) Ha már nullázva, nincs dolga
-  if (spent === 0 && shares === 0 && rest === 0) {
+  if (subtotalStored === 0 && shares === 0 && remainderStored === 0) {
     console.log('ℹ️  Already adjusted, nothing to do');
     return res.writeHead(200).end('Already adjusted');
   }
 
-  // 6) Előkészítjük a customer és order mutációt (magyar mezőnevek)
-  const adjustment = {
-    spentDelta:     -spent,
-    sharesDelta:    -shares,
-    remainderDelta: -rest
-  };
-  console.log('🔢 Computed deltas for customer adjustment:', adjustment);
+  // 6) Számoljuk és logoljuk a differenciát a customer számára
+  const spentDelta     = -subtotalStored;
+  const sharesDelta    = -shares;
+  const remainderDelta = -remainderStored;
+  console.log('🔢 Computed deltas for customer adjustment:', { spentDelta, sharesDelta, remainderDelta });
 
+  // 7) Előkészítjük a customer mutációt (magyar mezőnevek)
   const custInput = {
     id: `gid://shopify/Customer/${custId}`,
     metafields: [
-      { namespace: 'loyalty', key: 'net_spent_total',    type: 'number_decimal', value: adjustment.spentDelta.toFixed(2) },
-      { namespace: 'loyalty', key: 'reszvenyek_szama',   type: 'number_integer', value: adjustment.sharesDelta.toString() },
-      { namespace: 'custom',  key: 'jelenlegi_fennmarado',type: 'number_decimal', value: adjustment.remainderDelta.toFixed(2) }
+      { namespace: 'loyalty', key: 'net_spent_total',    type: 'number_decimal', value: spentDelta.toFixed(2) },
+      { namespace: 'loyalty', key: 'reszvenyek_szama',   type: 'number_integer', value: sharesDelta.toString() },
+      { namespace: 'custom',  key: 'jelenlegi_fennmarado',type: 'number_decimal', value: remainderDelta.toFixed(2) }
     ]
   };
   console.log('📝 Customer mutation input:', JSON.stringify(custInput, null, 2));
 
+  // 8) Előkészítjük az order mutációt a raktározott értékek nullázásához
   const orderInput = {
     id: `gid://shopify/Order/${orderId}`,
     metafields: [
-      { namespace: 'custom', key: 'osszes_koltes',      type: 'number_decimal', value: '0' },
-      { namespace: 'custom', key: 'order_share',        type: 'number_integer', value: '0' },
-      { namespace: 'custom', key: 'fennmarado_osszeg',  type: 'number_decimal', value: '0' }
+      { namespace: 'custom', key: 'subtotal',         type: 'number_decimal',  value: '0' },
+      { namespace: 'custom', key: 'order_share',      type: 'number_integer',  value: '0' },
+      { namespace: 'custom', key: 'order_remainder',  type: 'number_decimal',  value: '0' }
     ]
   };
   console.log('📝 Order mutation input:', JSON.stringify(orderInput, null, 2));
 
-  // 7) Végrehajtjuk a mutációt
+  // 9) Végrehajtjuk a mutációt
   try {
     const mutation = `
       mutation adjustCustomer($custInput: CustomerInput!, $orderInput: OrderInput!) {
@@ -161,7 +156,7 @@ module.exports = async (req, res) => {
     return res.writeHead(500).end('Update error');
   }
 
-  // 8) Válasz
+  // 10) Válasz
   console.log('🏁 /order-adjust finished, sending 200 OK');
   res.writeHead(200).end('OK');
 };
