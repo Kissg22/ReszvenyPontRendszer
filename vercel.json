@@ -6,12 +6,8 @@
       "dest": "/api/order-creation.js"
     },
     {
-      "src": "/webhook/refund",
-      "dest": "/api/refund.js"
-    },
-    {
-      "src": "/webhook/order-cancel",
-      "dest": "/api/order-cancel.js"
+      "src": "/webhook/(refund|order-cancel)",
+      "dest": "/api/order-adjust.js"
     }
   ]
 }
