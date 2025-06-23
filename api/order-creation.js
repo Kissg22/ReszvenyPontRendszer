@@ -65,31 +65,24 @@ module.exports = async (req, res) => {
   console.log('🔢 Computed values:', { subtotal, shareUnit });
 
   // 5) Lekérdezzük a customer aktuális állapotát
-  // order.customer.id lehet GID-string vagy Number
   const rawCustId = order.customer.id;
   const custGid   = String(rawCustId).split('/').pop();
   let prevSpent      = 0;
   let prevShares     = 0;
-  let prevLastOrder  = 0;
   let prevRemainder  = 0;
 
   try {
     const readRes = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type':           'application/json',
+      method: 'POST', headers: {
+        'Content-Type': 'application/json',
         'X-Shopify-Access-Token': token
       },
       body: JSON.stringify({
-        query: `
-          query getCustomer($id: ID!) {
-            customer(id: $id) {
-              netSpent:      metafield(namespace: "loyalty", key: "net_spent_total")    { value }
-              sharesCount:   metafield(namespace: "loyalty", key: "reszvenyek_szama")   { value }
-              lastOrderVal:  metafield(namespace: "loyalty", key: "last_order_value")    { value }
-              remainder:     metafield(namespace: "custom",  key: "jelenlegi_fennmarado") { value }
-            }
-          }
+        query: `query getCustomer($id: ID!) { customer(id: $id) {
+          netSpent: metafield(namespace: "loyalty", key: "net_spent_total"){ value }
+          sharesCount: metafield(namespace: "loyalty", key: "reszvenyek_szama"){ value }
+          remainder: metafield(namespace: "custom", key: "jelenlegi_fennmarado"){ value }
+        }}
         `,
         variables: { id: `gid://shopify/Customer/${custGid}` }
       })
@@ -99,14 +92,10 @@ module.exports = async (req, res) => {
 
     prevSpent     = parseFloat(data.customer.netSpent?.value    || '0');
     prevShares    = parseInt(data.customer.sharesCount?.value   || '0', 10);
-    prevLastOrder = parseFloat(data.customer.lastOrderVal?.value || '0');
     prevRemainder = parseFloat(data.customer.remainder?.value    || '0');
 
     console.log('📑 Previous customer state:', {
-      prevSpent:     prevSpent.toFixed(2),
-      prevShares,
-      prevLastOrder: prevLastOrder.toFixed(2),
-      prevRemainder: prevRemainder.toFixed(2)
+      prevSpent: prevSpent.toFixed(2), prevShares, prevRemainder: prevRemainder.toFixed(2)
     });
   } catch (e) {
     console.error('❌ Error fetching customer state:', e);
@@ -114,41 +103,37 @@ module.exports = async (req, res) => {
   }
 
   // 6) Új értékek kiszámolása és logolása
-  const newTotal       = prevSpent + subtotal;
-  const totalShares    = Math.floor(newTotal / shareUnit);
-  const earnedShares   = totalShares - prevShares;
-  const newRemainder   = newTotal % shareUnit;
+  const newTotal     = prevSpent + subtotal;
+  const totalShares  = Math.floor(newTotal / shareUnit);
+  const earnedShares = totalShares - prevShares;
+  const newRemainder = newTotal % shareUnit;
 
   console.log('📈 Calculated new values:', {
-    newTotal:     newTotal.toFixed(2),
-    totalShares,
-    earnedShares,
-    newRemainder: newRemainder.toFixed(2)
+    newTotal: newTotal.toFixed(2), totalShares, earnedShares, newRemainder: newRemainder.toFixed(2)
   });
 
   // 7) GraphQL mutáció előkészítése
   const mutation = `
     mutation updateBoth($custInput: CustomerInput!, $orderInput: OrderInput!) {
       customerUpdate(input: $custInput) { userErrors { field message } }
-      orderUpdate(input: $orderInput)     { userErrors { field message } }
+      orderUpdate(input: $orderInput)   { userErrors { field message } }
     }
   `;
   const variables = {
     custInput: {
       id: `gid://shopify/Customer/${custGid}`,
       metafields: [
-        { namespace: 'loyalty', key: 'net_spent_total',    type: 'number_decimal', value: newTotal.toFixed(2) },
-        { namespace: 'loyalty', key: 'reszvenyek_szama',   type: 'number_integer', value: totalShares.toString() },
-        { namespace: 'loyalty', key: 'last_order_value',   type: 'number_decimal', value: subtotal.toFixed(2) },
-        { namespace: 'custom',  key: 'jelenlegi_fennmarado',type: 'number_decimal', value: newRemainder.toFixed(2) }
+        { namespace: 'loyalty', key: 'net_spent_total',  type: 'number_decimal', value: newTotal.toFixed(2) },
+        { namespace: 'loyalty', key: 'reszvenyek_szama', type: 'number_integer', value: totalShares.toString() },
+        { namespace: 'custom',  key: 'jelenlegi_fennmarado', type: 'number_decimal', value: newRemainder.toFixed(2) }
       ]
     },
     orderInput: {
       id: `gid://shopify/Order/${order.id}`,
       metafields: [
-        { namespace: 'custom', key: 'osszes_koltes',      type: 'number_decimal',  value: subtotal.toFixed(2) },
-        { namespace: 'custom', key: 'order_share',        type: 'number_integer',  value: earnedShares.toString() },
-        { namespace: 'custom', key: 'fennmarado_osszeg',  type: 'number_decimal',  value: newRemainder.toFixed(2) }
+        { namespace: 'custom', key: 'subtotal',        type: 'number_decimal', value: subtotal.toFixed(2) },
+        { namespace: 'custom', key: 'order_share',     type: 'number_integer', value: earnedShares.toString() },
+        { namespace: 'custom', key: 'order_remainder', type: 'number_decimal', value: newRemainder.toFixed(2) }
       ]
     }
   };
@@ -158,9 +143,8 @@ module.exports = async (req, res) => {
   // 8) Mutáció végrehajtása
   try {
     const resp = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type':           'application/json',
+      method: 'POST', headers: {
+        'Content-Type': 'application/json',
         'X-Shopify-Access-Token': token
       },
       body: JSON.stringify({ query: mutation, variables })
