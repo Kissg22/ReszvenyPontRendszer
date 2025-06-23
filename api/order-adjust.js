@@ -63,12 +63,12 @@ module.exports = async (req, res) => {
   const token    = process.env.SHOPIFY_API_ACCESS_TOKEN;
   const endpoint = `https://${shop}.myshopify.com/admin/api/${process.env.SHOPIFY_API_VERSION}/graphql.json`;
 
-  // 4) Olvassuk ki az order metafieldeket
+  // 4) Olvassuk ki az order metafieldeket alias-okkal
   const readQuery = `
     query getOrderMeta($id: ID!) {
       order(id: $id) {
-        metafield(namespace: "custom", key: "effective_spend") { value }
-        metafield(namespace: "custom", key: "earned_shares")   { value }
+        effectiveMeta: metafield(namespace: "custom", key: "effective_spend") { value }
+        earnedMeta:    metafield(namespace: "custom", key: "earned_shares")   { value }
         customer { id }
       }
     }
@@ -90,8 +90,8 @@ module.exports = async (req, res) => {
     console.log('📨 Read meta response:', JSON.stringify(json, null, 2));
     if (json.errors && json.errors.length) throw json.errors;
 
-    eff     = parseFloat(json.data.order.metafield[0]?.value || '0');
-    shares  = parseInt(json.data.order.metafield[1]?.value || '0', 10);
+    eff     = parseFloat(json.data.order.effectiveMeta?.value || '0');
+    shares  = parseInt(json.data.order.earnedMeta?.value || '0', 10);
     custGid = json.data.order.customer.id.split('/').pop();
 
     console.log('📑 Order meta values:', {
