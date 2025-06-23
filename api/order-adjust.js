@@ -43,10 +43,7 @@ module.exports = async (req, res) => {
   let payload;
   try {
     payload = JSON.parse(buf.toString());
-    console.log('📦 Parsed payload:', {
-      id: payload.id || payload.order_id,
-      customer: payload.customer?.id
-    });
+    console.log('📦 Parsed payload:', { id: payload.id || payload.order_id, customer: payload.customer?.id });
   } catch (e) {
     console.error('❌ Invalid JSON payload:', e);
     return res.writeHead(400).end('Invalid JSON');
@@ -63,93 +60,90 @@ module.exports = async (req, res) => {
   const token    = process.env.SHOPIFY_API_ACCESS_TOKEN;
   const endpoint = `https://${shop}.myshopify.com/admin/api/${process.env.SHOPIFY_API_VERSION}/graphql.json`;
 
-  // 4) Olvassuk ki az order metafieldeket alias-okkal
+  // 4) Olvassuk ki az order metafieldeket alias-okkal (magyar mezőnevek)
   const readQuery = `
     query getOrderMeta($id: ID!) {
       order(id: $id) {
-        effectiveMeta: metafield(namespace: "custom", key: "effective_spend") { value }
-        earnedMeta:    metafield(namespace: "custom", key: "earned_shares")   { value }
+        osszMeta:  metafield(namespace: "custom", key: "osszes_koltes")    { value }
+        shareMeta: metafield(namespace: "custom", key: "order_share")      { value }
+        restMeta:  metafield(namespace: "custom", key: "fennmarado_osszeg") { value }
         customer { id }
       }
     }
   `;
-  let eff = 0, shares = 0, custGid;
+  let spent = 0, shares = 0, rest = 0, custId;
   try {
     const resp = await fetch(endpoint, {
       method: 'POST',
-      headers: {
-        'Content-Type':           'application/json',
-        'X-Shopify-Access-Token': token
-      },
-      body: JSON.stringify({
-        query: readQuery,
-        variables: { id: `gid://shopify/Order/${orderId}` }
-      })
+      headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': token },
+      body: JSON.stringify({ query: readQuery, variables: { id: `gid://shopify/Order/${orderId}` } })
     });
     const json = await resp.json();
     console.log('📨 Read meta response:', JSON.stringify(json, null, 2));
     if (json.errors && json.errors.length) throw json.errors;
 
-    eff     = parseFloat(json.data.order.effectiveMeta?.value || '0');
-    shares  = parseInt(json.data.order.earnedMeta?.value || '0', 10);
-    custGid = json.data.order.customer.id.split('/').pop();
+    spent   = parseFloat(json.data.order.osszMeta?.value || '0');
+    shares  = parseInt(json.data.order.shareMeta?.value || '0', 10);
+    rest    = parseFloat(json.data.order.restMeta?.value || '0');
+    custId  = json.data.order.customer.id.split('/').pop();
 
     console.log('📑 Order meta values:', {
-      effective_spend: eff.toFixed(2),
-      earned_shares: shares,
-      customer_id: custGid
+      spent: spent.toFixed(2),
+      shares,
+      rest: rest.toFixed(2),
+      custId
     });
   } catch (e) {
     console.error('❌ Error reading order meta:', e);
     return res.writeHead(500).end('Read meta error');
   }
 
-  if (eff === 0 && shares === 0) {
+  // 5) Ha már nullázva, nincs dolga
+  if (spent === 0 && shares === 0 && rest === 0) {
     console.log('ℹ️  Already adjusted, nothing to do');
     return res.writeHead(200).end('Already adjusted');
   }
 
-  // 5) Előkészítjük a customer és order mutációt
-  const mutation = `
-    mutation adjustCustomer($custInput: CustomerInput!, $orderInput: OrderInput!) {
-      customerUpdate(input: $custInput) { userErrors { field message } }
-      orderUpdate(input: $orderInput)     { userErrors { field message } }
-    }
-  `;
+  // 6) Előkészítjük a customer és order mutációt (magyar mezőnevek)
+  const adjustment = {
+    spentDelta:     -spent,
+    sharesDelta:    -shares,
+    remainderDelta: -rest
+  };
+  console.log('🔢 Computed deltas for customer adjustment:', adjustment);
+
   const custInput = {
-    id: `gid://shopify/Customer/${custGid}`,
+    id: `gid://shopify/Customer/${custId}`,
     metafields: [
-      {
-        namespace: 'loyalty',
-        key: 'net_spent_total',
-        type: 'number_decimal',
-        value: `-${eff.toFixed(2)}`
-      },
-      {
-        namespace: 'loyalty',
-        key: 'reszvenyek_szama',
-        type: 'number_integer',
-        value: `-${shares}`
-      }
+      { namespace: 'loyalty', key: 'net_spent_total',    type: 'number_decimal', value: adjustment.spentDelta.toFixed(2) },
+      { namespace: 'loyalty', key: 'reszvenyek_szama',   type: 'number_integer', value: adjustment.sharesDelta.toString() },
+      { namespace: 'custom',  key: 'jelenlegi_fennmarado',type: 'number_decimal', value: adjustment.remainderDelta.toFixed(2) }
     ]
   };
+  console.log('📝 Customer mutation input:', JSON.stringify(custInput, null, 2));
+
   const orderInput = {
     id: `gid://shopify/Order/${orderId}`,
     metafields: [
-      { namespace: 'custom', key: 'effective_spend', type: 'number_decimal', value: '0' },
-      { namespace: 'custom', key: 'earned_shares',   type: 'number_integer', value: '0' }
+      { namespace: 'custom', key: 'osszes_koltes',      type: 'number_decimal', value: '0' },
+      { namespace: 'custom', key: 'order_share',        type: 'number_integer', value: '0' },
+      { namespace: 'custom', key: 'fennmarado_osszeg',  type: 'number_decimal', value: '0' }
     ]
   };
-  console.log('📝 Mutation variables:', JSON.stringify({ custInput, orderInput }, null, 2));
+  console.log('📝 Order mutation input:', JSON.stringify(orderInput, null, 2));
 
-  // 6) Végrehajtjuk a mutációt
+  // 7) Végrehajtjuk a mutációt
   try {
+    const mutation = `
+      mutation adjustCustomer($custInput: CustomerInput!, $orderInput: OrderInput!) {
+        customerUpdate(input: $custInput) { userErrors { field message } }
+        orderUpdate(input: $orderInput)     { userErrors { field message } }
+      }
+    `;
+    console.log('🔄 Sending mutation...');
     const resp = await fetch(endpoint, {
       method: 'POST',
-      headers: {
-        'Content-Type':           'application/json',
-        'X-Shopify-Access-Token': token
-      },
+      headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': token },
       body: JSON.stringify({ query: mutation, variables: { custInput, orderInput } })
     });
     const result = await resp.json();
@@ -167,7 +161,7 @@ module.exports = async (req, res) => {
     return res.writeHead(500).end('Update error');
   }
 
-  // 7) Válasz
+  // 8) Válasz
   console.log('🏁 /order-adjust finished, sending 200 OK');
   res.writeHead(200).end('OK');
 };
