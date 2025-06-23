@@ -27,13 +27,14 @@ module.exports = async (req, res) => {
     console.error('❌ Error reading body:', e);
     return res.writeHead(400).end('Invalid body');
   }
-  const hmac   = req.headers['x-shopify-hmac-sha256'];
-  const digest = crypto.createHmac('sha256', process.env.SHOPIFY_API_SECRET_KEY)
-                       .update(buf)
-                       .digest('base64');
-  console.log('🔐 Received HMAC:', hmac);
-  console.log('🔑 Computed HMAC:', digest);
-  if (!hmac || hmac !== digest) {
+  const hmacHeader = req.headers['x-shopify-hmac-sha256'];
+  const computedHmac = crypto
+    .createHmac('sha256', process.env.SHOPIFY_API_SECRET_KEY)
+    .update(buf)
+    .digest('base64');
+  console.log('🔐 Received HMAC:', hmacHeader);
+  console.log('🔑 Computed HMAC:', computedHmac);
+  if (!hmacHeader || hmacHeader !== computedHmac) {
     console.error('❌ HMAC validation failed');
     return res.writeHead(401).end('HMAC validation failed');
   }
@@ -57,42 +58,51 @@ module.exports = async (req, res) => {
   }
   console.log(`🔔 Processing adjustment for order ${orderId}`);
 
-  const shop     = process.env.SHOPIFY_SHOP_NAME;
-  const token    = process.env.SHOPIFY_API_ACCESS_TOKEN;
-  const endpoint = `https://${shop}.myshopify.com/admin/api/${process.env.SHOPIFY_API_VERSION}/graphql.json`;
+  const shop      = process.env.SHOPIFY_SHOP_NAME;
+  const token     = process.env.SHOPIFY_API_ACCESS_TOKEN;
+  const apiVer    = process.env.SHOPIFY_API_VERSION;
+  const endpoint  = `https://${shop}.myshopify.com/admin/api/${apiVer}/graphql.json`;
+  const shareUnit = Number(process.env.SHARE_UNIT);
+  console.log('🔢 Share unit:', shareUnit);
 
   // 5) Olvassuk ki az order Meta adatokat
   const orderMetaQuery = `
     query getOrderMeta($id: ID!) {
       order(id: $id) {
-        subtotalMeta: metafield(namespace: "custom", key: "subtotal")         { value }
-        shareMeta:    metafield(namespace: "custom", key: "order_share")      { value }
-        remainderMeta:metafield(namespace: "custom", key: "order_remainder") { value }
+        subtotal    : metafield(namespace: "custom", key: "subtotal")         { value }
+        orderShare  : metafield(namespace: "custom", key: "order_share")      { value }
+        orderRem    : metafield(namespace: "custom", key: "order_remainder")  { value }
         customer { id }
       }
     }
   `;
-  let subtotalStored = 0, sharesStored = 0, remainderStored = 0;
-  let custGid;
+  let subtotalStored = 0, sharesStored = 0, remainderStored = 0, custGid;
   try {
     const resp = await fetch(endpoint, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': token },
-      body: JSON.stringify({ query: orderMetaQuery, variables: { id: `gid://shopify/Order/${orderId}` } })
+      headers: { 
+        'Content-Type': 'application/json',
+        'X-Shopify-Access-Token': token
+      },
+      body: JSON.stringify({
+        query: orderMetaQuery,
+        variables: { id: `gid://shopify/Order/${orderId}` }
+      })
     });
     const { data, errors } = await resp.json();
     if (errors?.length) throw errors;
     const ord = data.order;
-    if (!ord) throw new Error('Order not found');
+    if (!ord) throw new Error('Order not found in GraphQL');
 
-    subtotalStored   = parseFloat(ord.subtotalMeta?.value || '0');
-    sharesStored     = parseInt(ord.shareMeta?.value || '0', 10);
-    remainderStored  = parseFloat(ord.remainderMeta?.value || '0');
-    custGid          = ord.customer.id.split('/').pop();
+    subtotalStored  = parseFloat(ord.subtotal?.value     || '0');
+    sharesStored    = parseInt(ord.orderShare?.value     || '0', 10);
+    remainderStored = parseFloat(ord.orderRem?.value     || '0');
+    custGid         = ord.customer.id.split('/').pop();
+
     console.log('📑 Order stored values:', { subtotalStored, sharesStored, remainderStored, custGid });
   } catch (e) {
     console.error('❌ Error reading order meta:', e);
-    return res.writeHead(500).end('Read meta error');
+    return res.writeHead(500).end('Read order meta error');
   }
 
   // 6) Ha már nullázva, nincs dolga
@@ -101,13 +111,13 @@ module.exports = async (req, res) => {
     return res.writeHead(200).end('Already adjusted');
   }
 
-  // 7) Fetch current customer state
+  // 7) Lekérdezzük a customer aktuális állapotát
   const customerMetaQuery = `
     query getCustomer($id: ID!) {
       customer(id: $id) {
-        netSpent:     metafield(namespace: "loyalty", key: "net_spent_total")    { value }
-        sharesCount:  metafield(namespace: "loyalty", key: "reszvenyek_szama")   { value }
-        remainder:    metafield(namespace: "custom",  key: "jelenlegi_fennmarado") { value }
+        netSpent   : metafield(namespace: "loyalty", key: "net_spent_total")    { value }
+        sharesCnt  : metafield(namespace: "loyalty", key: "reszvenyek_szama")   { value }
+        currRem    : metafield(namespace: "custom",  key: "jelenlegi_fennmarado"){ value }
       }
     }
   `;
@@ -115,40 +125,46 @@ module.exports = async (req, res) => {
   try {
     const resp = await fetch(endpoint, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': token },
-      body: JSON.stringify({ query: customerMetaQuery, variables: { id: `gid://shopify/Customer/${custGid}` } })
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Shopify-Access-Token': token
+      },
+      body: JSON.stringify({
+        query: customerMetaQuery,
+        variables: { id: `gid://shopify/Customer/${custGid}` }
+      })
     });
     const { data, errors } = await resp.json();
     if (errors?.length) throw errors;
     const cus = data.customer;
-    prevSpent     = parseFloat(cus.netSpent?.value || '0');
-    prevShares    = parseInt(cus.sharesCount?.value || '0', 10);
-    prevRemainder = parseFloat(cus.remainder?.value || '0');
+    prevSpent     = parseFloat(cus.netSpent?.value    || '0');
+    prevShares    = parseInt(cus.sharesCnt?.value    || '0', 10);
+    prevRemainder = parseFloat(cus.currRem?.value    || '0');
     console.log('📑 Previous customer state:', { prevSpent, prevShares, prevRemainder });
   } catch (e) {
     console.error('❌ Error fetching customer state:', e);
-    return res.writeHead(500).end('Fetch customer error');
+    return res.writeHead(500).end('Fetch customer meta error');
   }
 
-  // 8) Számoljuk a new customer values
-  const newSpent     = prevSpent - subtotalStored;
-  const newShares    = prevShares - sharesStored;
-  const newRemainder = prevRemainder - remainderStored;
-  console.log('📈 Computed new customer state:', { newSpent, newShares, newRemainder });
+  // 8) Számoljuk a new customer values a teljes nettó költés maradékával
+  const newTotal     = prevSpent - subtotalStored;
+  const newShares    = Math.floor(newTotal / shareUnit);
+  const newRemainder = newTotal % shareUnit;
+  console.log('📈 Computed new customer state:', { newTotal, newShares, newRemainder });
 
-  // 9) Előkészítjük a customer és order mutációt
+  // 9) GraphQL mutáció előkészítése
   const mutation = `
     mutation adjust($custInput: CustomerInput!, $orderInput: OrderInput!) {
       customerUpdate(input: $custInput) { userErrors { field message } }
-      orderUpdate(input: $orderInput)     { userErrors { field message } }
+      orderUpdate(input: $orderInput)   { userErrors { field message } }
     }
   `;
   const custInput = {
     id: `gid://shopify/Customer/${custGid}`,
     metafields: [
-      { namespace: 'loyalty', key: 'net_spent_total',    type: 'number_decimal', value: newSpent.toFixed(2) },
-      { namespace: 'loyalty', key: 'reszvenyek_szama',   type: 'number_integer', value: newShares.toString() },
-      { namespace: 'custom',  key: 'jelenlegi_fennmarado',type: 'number_decimal', value: newRemainder.toFixed(2) }
+      { namespace: 'loyalty', key: 'net_spent_total',      type: 'number_decimal',  value: newTotal.toFixed(2) },
+      { namespace: 'loyalty', key: 'reszvenyek_szama',     type: 'number_integer',  value: newShares.toString() },
+      { namespace: 'custom',  key: 'jelenlegi_fennmarado',  type: 'number_decimal',  value: newRemainder.toFixed(2) }
     ]
   };
   const orderInput = {
@@ -161,19 +177,24 @@ module.exports = async (req, res) => {
   };
   console.log('📝 Mutation inputs:', { custInput, orderInput });
 
-  // 10) Végrehajtjuk a mutációt
+  // 10) Mutáció végrehajtása
   try {
-    console.log('🔄 Sending mutation...');
     const resp = await fetch(endpoint, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': token },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Shopify-Access-Token': token
+      },
       body: JSON.stringify({ query: mutation, variables: { custInput, orderInput } })
     });
     const result = await resp.json();
     console.log('📨 Mutation response:', JSON.stringify(result, null, 2));
-    const errs = [...result.data.customerUpdate.userErrors, ...result.data.orderUpdate.userErrors];
-    if (errs.length) {
-      console.error('❌ Mutation user errors:', errs);
+    const errors = [
+      ...result.data.customerUpdate.userErrors,
+      ...result.data.orderUpdate.userErrors
+    ];
+    if (errors.length) {
+      console.error('❌ Mutation user errors:', errors);
       return res.writeHead(500).end('Adjust error');
     }
     console.log('✅ Adjustment applied successfully');
