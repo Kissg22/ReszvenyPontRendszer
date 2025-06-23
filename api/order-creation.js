@@ -65,7 +65,9 @@ module.exports = async (req, res) => {
   console.log('🔢 Computed values:', { subtotal, shareUnit });
 
   // 5) Lekérdezzük a customer aktuális állapotát
-  const custGid = order.customer.id.split('/').pop();
+  // order.customer.id lehet GID-string vagy Number
+  const rawCustId = order.customer.id;
+  const custGid   = String(rawCustId).split('/').pop();
   let prevSpent      = 0;
   let prevShares     = 0;
   let prevLastOrder  = 0;
