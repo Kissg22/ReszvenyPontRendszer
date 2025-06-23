@@ -54,7 +54,6 @@ module.exports = async (req, res) => {
   let adjustAmount = 0;
   const items = payload.refund_line_items
     || payload.refunds.flatMap(r => r.refund_line_items || []);
-
   for (const li of items) {
     const amt = li.subtotal_set?.presentment_money?.amount
               || li.subtotal
@@ -68,14 +67,12 @@ module.exports = async (req, res) => {
     return res.writeHead(200).end('Zero refund');
   }
 
-  // 5) Order & Customer IDs
+  // 5) Determine order & customer IDs
   const orderId = payload.order_id || payload.id;
   if (!orderId) {
     console.error('❌ Missing order ID');
     return res.writeHead(400).end('Missing order ID');
   }
-
-  // 6) Determine customer GID
   let custGid = payload.customer?.id;
   if (!custGid) {
     try {
@@ -95,19 +92,51 @@ module.exports = async (req, res) => {
   }
   const custId = String(custGid).split('/').pop();
 
-  // 7) Fetch existing loyalty meta for customer
   const gqlEndpoint = `https://${process.env.SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/${process.env.SHOPIFY_API_VERSION}/graphql.json`;
-  const customerMetaQuery = `
-    query getCustomerMeta($id: ID!) {
-      customer(id: $id) {
-        netSpent: metafield(namespace: "loyalty", key: "net_spent_total") { value }
-        shareCount: metafield(namespace: "loyalty", key: "reszvenyek_szama") { value }
+
+  // 6) Fetch existing order subtotal meta
+  const orderMetaQuery = `
+    query getOrderMeta($id: ID!) {
+      order(id: $id) {
+        subtotalMeta: metafield(namespace: \"custom\", key: \"subtotal\") { value }
       }
     }
   `;
+  let prevOrderSubtotal = 0;
+  try {
+    const resp = await fetch(gqlEndpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Shopify-Access-Token': process.env.SHOPIFY_API_ACCESS_TOKEN
+      },
+      body: JSON.stringify({ query: orderMetaQuery, variables: { id: `gid://shopify/Order/${orderId}` } })
+    });
+    const { data, errors } = await resp.json();
+    if (errors?.length) throw errors;
+    prevOrderSubtotal = Number(data.order.subtotalMeta?.value || 0);
+    console.log(`🔍 Previous order subtotal: ${prevOrderSubtotal.toFixed(2)}`);
+  } catch (err) {
+    console.error('❌ Error reading order meta:', err);
+    return res.writeHead(500).end('Order meta fetch error');
+  }
 
+  // Calculate new order values
+  const newOrderSubtotal = prevOrderSubtotal - adjustAmount;
+  const newOrderShares = Math.floor(newOrderSubtotal / shareUnit);
+  const newOrderRemainder = newOrderSubtotal % shareUnit;
+  console.log('📦 Computed new order meta:', { newOrderSubtotal, newOrderShares, newOrderRemainder });
+
+  // 7) Fetch existing customer loyalty meta
+  const customerMetaQuery = `
+    query getCustomerMeta($id: ID!) {
+      customer(id: $id) {
+        netSpent: metafield(namespace: \"loyalty\", key: \"net_spent_total\") { value }
+        shareCount: metafield(namespace: \"loyalty\", key: \"reszvenyek_szama\") { value }
+      }
+    }
+  `;
   let prevSpent = 0;
-  let prevShares = 0;
   try {
     const resp = await fetch(gqlEndpoint, {
       method: 'POST',
@@ -120,21 +149,19 @@ module.exports = async (req, res) => {
     const { data, errors } = await resp.json();
     if (errors?.length) throw errors;
     prevSpent = Number(data.customer.netSpent?.value || 0);
-    prevShares = Number(data.customer.shareCount?.value || 0);
-    console.log(`🔍 Previous spent: ${prevSpent}, shares: ${prevShares}`);
+    console.log(`🔍 Previous customer spent: ${prevSpent.toFixed(2)}`);
   } catch (err) {
     console.error('❌ Error reading customer meta:', err);
     return res.writeHead(500).end('Customer meta fetch error');
   }
 
-  // 8) Calculate new loyalty values
-  const adjustShares = Math.floor(adjustAmount / shareUnit);
-  const newSpent = prevSpent - adjustAmount;
-  const newShares = prevShares - adjustShares;
-  const newRemainder = newSpent % shareUnit;
-  console.log('🔢 Computed new loyalty:', { newSpent, newShares, newRemainder });
+  // Calculate new customer loyalty
+  const newCustSpent = prevSpent - adjustAmount;
+  const newCustShares = Math.floor(newCustSpent / shareUnit);
+  const newCustRemainder = newCustSpent % shareUnit;
+  console.log('🔢 Computed new customer loyalty:', { newCustSpent, newCustShares, newCustRemainder });
 
-  // 9) Prepare mutation to update customer & order metafields
+  // 8) Prepare mutation to update both customer and order metafields
   const mutation = `
     mutation Adjust($custInput: CustomerInput!, $orderInput: OrderInput!) {
       customerUpdate(input: $custInput) { userErrors { field message } }
@@ -145,22 +172,22 @@ module.exports = async (req, res) => {
   const custInput = {
     id: `gid://shopify/Customer/${custId}`,
     metafields: [
-      { namespace: 'loyalty', key: 'net_spent_total', type: 'number_decimal', value: newSpent.toFixed(2) },
-      { namespace: 'loyalty', key: 'reszvenyek_szama', type: 'number_integer', value: String(newShares) },
-      { namespace: 'custom',  key: 'jelenlegi_fennmarado', type: 'number_decimal', value: newRemainder.toFixed(2) }
+      { namespace: 'loyalty', key: 'net_spent_total', type: 'number_decimal', value: newCustSpent.toFixed(2) },
+      { namespace: 'loyalty', key: 'reszvenyek_szama', type: 'number_integer', value: String(newCustShares) },
+      { namespace: 'custom',  key: 'jelenlegi_fennmarado', type: 'number_decimal', value: newCustRemainder.toFixed(2) }
     ]
   };
 
   const orderInput = {
     id: `gid://shopify/Order/${orderId}`,
     metafields: [
-      { namespace: 'custom', key: 'subtotal',        type: 'number_decimal', value: '0' },
-      { namespace: 'custom', key: 'order_share',     type: 'number_integer', value: '0' },
-      { namespace: 'custom', key: 'order_remainder', type: 'number_decimal', value: '0' }
+      { namespace: 'custom', key: 'subtotal',        type: 'number_decimal',  value: newOrderSubtotal.toFixed(2) },
+      { namespace: 'custom', key: 'order_share',     type: 'number_integer',  value: String(newOrderShares) },
+      { namespace: 'custom', key: 'order_remainder', type: 'number_decimal',  value: newOrderRemainder.toFixed(2) }
     ]
   };
 
-  // 10) Execute mutation
+  // 9) Execute mutation
   try {
     const resp = await fetch(gqlEndpoint, {
       method: 'POST',
@@ -185,7 +212,7 @@ module.exports = async (req, res) => {
     return res.writeHead(500).end('Update error');
   }
 
-  // 11) Respond OK
+  // 10) Respond OK
   console.log('🏁 /order-adjust finished');
   res.writeHead(200).end('OK');
 };
