@@ -44,14 +44,14 @@ module.exports = async (req, res) => {
   let payload;
   try {
     payload = JSON.parse(buf.toString());
-    console.log('📦 Parsed payload:', { orderId: payload.id || payload.order_id });
+    console.log('📦 Parsed payload:', { orderId: payload.id, order_id: payload.order_id });
   } catch (e) {
     console.error('❌ Invalid JSON payload:', e);
     return res.writeHead(400).end('Invalid JSON');
   }
 
-  // 4) Order ID kinyerése
-  const orderId = payload.id || payload.order_id;
+  // 4) Order ID kinyerése (refund/cancel esetén order_id)
+  const orderId = payload.order_id || payload.id;
   if (!orderId) {
     console.log('▶️ Not an order event, skipping');
     return res.writeHead(200).end('Not an order event');
@@ -69,9 +69,9 @@ module.exports = async (req, res) => {
   const orderMetaQuery = `
     query getOrderMeta($id: ID!) {
       order(id: $id) {
-        subtotal    : metafield(namespace: "custom", key: "subtotal")         { value }
-        orderShare  : metafield(namespace: "custom", key: "order_share")      { value }
-        orderRem    : metafield(namespace: "custom", key: "order_remainder")  { value }
+        subtotalMeta  : metafield(namespace: "custom", key: "subtotal")         { value }
+        orderShareMeta: metafield(namespace: "custom", key: "order_share")      { value }
+        orderRemMeta  : metafield(namespace: "custom", key: "order_remainder")  { value }
         customer { id }
       }
     }
@@ -94,11 +94,10 @@ module.exports = async (req, res) => {
     const ord = data.order;
     if (!ord) throw new Error('Order not found in GraphQL');
 
-    subtotalStored  = parseFloat(ord.subtotal?.value     || '0');
-    sharesStored    = parseInt(ord.orderShare?.value     || '0', 10);
-    remainderStored = parseFloat(ord.orderRem?.value     || '0');
+    subtotalStored  = parseFloat(ord.subtotalMeta?.value   || '0');
+    sharesStored    = parseInt(ord.orderShareMeta?.value   || '0', 10);
+    remainderStored = parseFloat(ord.orderRemMeta?.value   || '0');
     custGid         = ord.customer.id.split('/').pop();
-
     console.log('📑 Order stored values:', { subtotalStored, sharesStored, remainderStored, custGid });
   } catch (e) {
     console.error('❌ Error reading order meta:', e);
@@ -115,9 +114,9 @@ module.exports = async (req, res) => {
   const customerMetaQuery = `
     query getCustomer($id: ID!) {
       customer(id: $id) {
-        netSpent   : metafield(namespace: "loyalty", key: "net_spent_total")    { value }
-        sharesCnt  : metafield(namespace: "loyalty", key: "reszvenyek_szama")   { value }
-        currRem    : metafield(namespace: "custom",  key: "jelenlegi_fennmarado"){ value }
+        netSpentMeta:       metafield(namespace: "loyalty", key: "net_spent_total")   { value }
+        sharesCountMeta:    metafield(namespace: "loyalty", key: "reszvenyek_szama")  { value }
+        currRemMeta:        metafield(namespace: "custom",  key: "jelenlegi_fennmarado"){ value }
       }
     }
   `;
@@ -125,9 +124,9 @@ module.exports = async (req, res) => {
   try {
     const resp = await fetch(endpoint, {
       method: 'POST',
-      headers: {
+      headers: { 
         'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': token
+        'X-Shopify-Access-Token': token 
       },
       body: JSON.stringify({
         query: customerMetaQuery,
@@ -137,16 +136,16 @@ module.exports = async (req, res) => {
     const { data, errors } = await resp.json();
     if (errors?.length) throw errors;
     const cus = data.customer;
-    prevSpent     = parseFloat(cus.netSpent?.value    || '0');
-    prevShares    = parseInt(cus.sharesCnt?.value    || '0', 10);
-    prevRemainder = parseFloat(cus.currRem?.value    || '0');
+    prevSpent     = parseFloat(cus.netSpentMeta?.value   || '0');
+    prevShares    = parseInt(cus.sharesCountMeta?.value || '0', 10);
+    prevRemainder = parseFloat(cus.currRemMeta?.value   || '0');
     console.log('📑 Previous customer state:', { prevSpent, prevShares, prevRemainder });
   } catch (e) {
     console.error('❌ Error fetching customer state:', e);
     return res.writeHead(500).end('Fetch customer meta error');
   }
 
-  // 8) Számoljuk a new customer values a teljes nettó költés maradékával
+  // 8) Számoljuk az új customer-értékeket: nettó költés maradéka shareUnit-tel osztva
   const newTotal     = prevSpent - subtotalStored;
   const newShares    = Math.floor(newTotal / shareUnit);
   const newRemainder = newTotal % shareUnit;
@@ -154,7 +153,10 @@ module.exports = async (req, res) => {
 
   // 9) GraphQL mutáció előkészítése
   const mutation = `
-    mutation adjust($custInput: CustomerInput!, $orderInput: OrderInput!) {
+    mutation adjust(
+      $custInput: CustomerInput!, 
+      $orderInput: OrderInput!
+    ) {
       customerUpdate(input: $custInput) { userErrors { field message } }
       orderUpdate(input: $orderInput)   { userErrors { field message } }
     }
@@ -162,17 +164,17 @@ module.exports = async (req, res) => {
   const custInput = {
     id: `gid://shopify/Customer/${custGid}`,
     metafields: [
-      { namespace: 'loyalty', key: 'net_spent_total',      type: 'number_decimal',  value: newTotal.toFixed(2) },
-      { namespace: 'loyalty', key: 'reszvenyek_szama',     type: 'number_integer',  value: newShares.toString() },
-      { namespace: 'custom',  key: 'jelenlegi_fennmarado',  type: 'number_decimal',  value: newRemainder.toFixed(2) }
+      { namespace: 'loyalty', key: 'net_spent_total',     type: 'number_decimal', value: newTotal.toFixed(2) },
+      { namespace: 'loyalty', key: 'reszvenyek_szama',    type: 'number_integer', value: newShares.toString() },
+      { namespace: 'custom',  key: 'jelenlegi_fennmarado', type: 'number_decimal', value: newRemainder.toFixed(2) }
     ]
   };
   const orderInput = {
     id: `gid://shopify/Order/${orderId}`,
     metafields: [
-      { namespace: 'custom', key: 'subtotal',         type: 'number_decimal', value: '0' },
-      { namespace: 'custom', key: 'order_share',      type: 'number_integer', value: '0' },
-      { namespace: 'custom', key: 'order_remainder',  type: 'number_decimal', value: '0' }
+      { namespace: 'custom', key: 'subtotal',        type: 'number_decimal', value: '0' },
+      { namespace: 'custom', key: 'order_share',     type: 'number_integer', value: '0' },
+      { namespace: 'custom', key: 'order_remainder', type: 'number_decimal', value: '0' }
     ]
   };
   console.log('📝 Mutation inputs:', { custInput, orderInput });
@@ -181,20 +183,20 @@ module.exports = async (req, res) => {
   try {
     const resp = await fetch(endpoint, {
       method: 'POST',
-      headers: {
+      headers: { 
         'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': token
+        'X-Shopify-Access-Token': token 
       },
       body: JSON.stringify({ query: mutation, variables: { custInput, orderInput } })
     });
     const result = await resp.json();
     console.log('📨 Mutation response:', JSON.stringify(result, null, 2));
-    const errors = [
+    const errs = [
       ...result.data.customerUpdate.userErrors,
       ...result.data.orderUpdate.userErrors
     ];
-    if (errors.length) {
-      console.error('❌ Mutation user errors:', errors);
+    if (errs.length) {
+      console.error('❌ Mutation user errors:', errs);
       return res.writeHead(500).end('Adjust error');
     }
     console.log('✅ Adjustment applied successfully');
