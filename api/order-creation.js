@@ -6,15 +6,15 @@ const bodyParser = require('body-parser');
 const { google } = require('googleapis');
 
 // Log version
-console.log('🔄 Loaded webhook-to-sheets v4');
+console.log('🔄 Loaded webhook-to-sheets v5');
 
 const app = express();
 app.use(bodyParser.raw({ type: 'application/json' }));
 
-// Verify Shopify HMAC signature
+// Verify Shopify HMAC signature (using API secret key)
 function verifyShopifyWebhook(req) {
   const secret = process.env.SHOPIFY_API_SECRET_KEY;
-  if (!secret) throw new Error('Missing SHOPIFY_WEBHOOK_SECRET');
+  if (!secret) throw new Error('Missing SHOPIFY_API_SECRET_KEY');
   const hmacHeader = req.headers['x-shopify-hmac-sha256'];
   const digest = crypto
     .createHmac('sha256', secret)
@@ -34,6 +34,7 @@ function formatHuDate(iso) {
 
 // Append order to sheet
 async function appendOrderToSheet(order) {
+  // Authenticate
   const auth = new google.auth.GoogleAuth({
     credentials: {
       client_email: process.env.GOOGLE_CLIENT_EMAIL,
@@ -41,23 +42,24 @@ async function appendOrderToSheet(order) {
     },
     scopes: ['https://www.googleapis.com/auth/spreadsheets'],
   });
-  const sheets = google.sheets({ version: 'v4', auth: await auth.getClient() });
+  const client = await auth.getClient();
+  const sheets = google.sheets({ version: 'v4', auth: client });
 
-  // Build row with extra fields
+  // Build row with all fields
   const customer = order.customer || {};
   const shipping = order.shipping_address || {};
   const billing = order.billing_address || {};
-  const lineItems = order.line_items.map(i => `${i.title} x${i.quantity}`).join('; ');
+  const lineItems = (order.line_items || []).map(i => `${i.title} x${i.quantity}`).join('; ');
 
   const row = [
     order.id,
-    order.name,                     // Order number
+    order.name,
     order.customer_id || '',
     [customer.first_name, customer.last_name].filter(Boolean).join(' '),
     customer.email || '',
-    order.created_at,               // Raw ISO
-    formatHuDate(order.created_at), // HU+2
-    order.line_items.length,
+    order.created_at,
+    formatHuDate(order.created_at),
+    (order.line_items || []).length,
     lineItems,
     order.subtotal_price,
     order.total_price,
@@ -69,11 +71,11 @@ async function appendOrderToSheet(order) {
     `${shipping.address1 || ''} ${shipping.city || ''}`.trim(),
     billing.name || '',
     `${billing.address1 || ''} ${billing.city || ''}`.trim(),
-    order.tags,                     // tags
-    order.note || ''                // order note
+    order.tags,
+    order.note || ''
   ];
 
-  console.log('Appending row:', row);
+  console.log('📋 Appending row:', row);
 
   await sheets.spreadsheets.values.append({
     spreadsheetId: process.env.SPREADSHEET_ID,
@@ -86,10 +88,14 @@ async function appendOrderToSheet(order) {
   console.log(`✅ Order ${order.id} appended with ${row.length} columns`);
 }
 
+// Webhook endpoint
 app.post('/webhook/order-creation', async (req, res) => {
   try {
     if (!verifyShopifyWebhook(req)) return res.status(401).send('Unauthorized');
+
     const order = JSON.parse(req.body.toString('utf8'));
+    console.log('📦 Full Order Payload:', JSON.stringify(order, null, 2));
+
     await appendOrderToSheet(order);
     res.status(200).send('OK');
   } catch (e) {
@@ -98,6 +104,6 @@ app.post('/webhook/order-creation', async (req, res) => {
   }
 });
 
-
+// Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Listening on ${PORT}`));
