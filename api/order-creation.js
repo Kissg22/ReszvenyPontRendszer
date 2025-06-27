@@ -13,7 +13,7 @@ app.use(bodyParser.raw({ type: 'application/json' }));
 
 // Verify Shopify HMAC signature
 function verifyShopifyWebhook(req) {
-  const secret = process.env.SHOPIFY_WEBHOOK_SECRET;
+  const secret = process.env.SHOPIFY_API_SECRET_KEY;
   if (!secret) throw new Error('Missing SHOPIFY_WEBHOOK_SECRET env var');
   const hmacHeader = req.headers['x-shopify-hmac-sha256'];
   const digest = crypto
