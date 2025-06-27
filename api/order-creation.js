@@ -5,22 +5,35 @@ const crypto = require('crypto');
 const bodyParser = require('body-parser');
 const { google } = require('googleapis');
 
+// Log version at startup
+console.log('🔄 Loaded webhook-to-sheets v3');
+
 const app = express();
-// Shopify sends raw JSON for signature verification
 app.use(bodyParser.raw({ type: 'application/json' }));
 
-// Validate Shopify HMAC signature
+// Verify Shopify HMAC signature
 function verifyShopifyWebhook(req) {
+  const secret = process.env.SHOPIFY_WEBHOOK_SECRET;
+  if (!secret) throw new Error('Missing SHOPIFY_WEBHOOK_SECRET env var');
   const hmacHeader = req.headers['x-shopify-hmac-sha256'];
   const digest = crypto
-    .createHmac('sha256', process.env.SHOPIFY_API_SECRET_KEY)
+    .createHmac('sha256', secret)
     .update(req.body, 'utf8')
     .digest('base64');
   return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader));
 }
 
-// Append order details to Google Sheet
+// Format date manually to Hungarian style
+function formatHuDate(iso) {
+  const d = new Date(iso);
+  const pad = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}.${pad(d.getMonth()+1)}.${pad(d.getDate())}` +
+         ` ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+// Append order to sheet
 async function appendOrderToSheet(order) {
+  // Create auth & client each time to avoid stale promise
   const auth = new google.auth.GoogleAuth({
     credentials: {
       client_email: process.env.GOOGLE_CLIENT_EMAIL,
@@ -28,56 +41,49 @@ async function appendOrderToSheet(order) {
     },
     scopes: ['https://www.googleapis.com/auth/spreadsheets'],
   });
-  const client = await auth.getClient();
-  const sheets = google.sheets({ version: 'v4', auth: client });
+  const sheets = google.sheets({ version: 'v4', auth: await auth.getClient() });
 
-  // Extract needed fields
-  const itemsCount = order.line_items.length;
-  const subtotal = order.subtotal_price;
-  const createdAt = order.created_at;
-  const customer = order.customer || {};
-  const customerName = [customer.first_name, customer.last_name].filter(Boolean).join(' ');
-  const customerEmail = customer.email || '';
-
-  const values = [[
+  const row = [
     order.id,
-    itemsCount,
-    subtotal,
-    createdAt,
-    customerName,
-    customerEmail,
-  ]];
+    order.customer_id || '',
+    [order.customer?.first_name, order.customer?.last_name].filter(Boolean).join(' '),
+    order.customer?.email || '',
+    order.line_items.length,
+    order.line_items.map(i => `${i.title} x${i.quantity}`).join('; '),
+    order.subtotal_price,
+    order.total_price,
+    order.currency,
+    order.financial_status,
+    formatHuDate(order.created_at),
+    order.shipping_address
+      ? `${order.shipping_address.city}, ${order.shipping_address.address1}`
+      : ''
+  ];
+
+  console.log('Appending row:', row);
 
   await sheets.spreadsheets.values.append({
     spreadsheetId: process.env.SPREADSHEET_ID,
-    range: `${process.env.SHEET_NAME}!A:F`,
+    range: `${process.env.SHEET_NAME}!A:L`,
     valueInputOption: 'RAW',
     insertDataOption: 'INSERT_ROWS',
-    resource: { values },
+    resource: { values: [row] },
   });
 
-  console.log(`Order written to sheet: ${order.id}`);
+  console.log(`✅ Order ${order.id} appended`);
 }
 
-// Webhook endpoint
 app.post('/webhook/order-creation', async (req, res) => {
   try {
-    if (!verifyShopifyWebhook(req)) {
-      console.error('Webhook signature validation failed');
-      return res.status(401).send('Unauthorized');
-    }
-
+    if (!verifyShopifyWebhook(req)) return res.status(401).send('Unauthorized');
     const order = JSON.parse(req.body.toString('utf8'));
     await appendOrderToSheet(order);
     res.status(200).send('OK');
-  } catch (err) {
-    console.error('Error handling webhook:', err);
+  } catch (e) {
+    console.error('❌ Handler error:', e);
     res.status(500).send('Error');
   }
 });
 
-// Start server
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🚀 Listening on ${PORT}`));
