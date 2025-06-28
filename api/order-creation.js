@@ -3,13 +3,15 @@ require('dotenv').config();
 const express = require('express');
 const crypto = require('crypto');
 const { google } = require('googleapis');
-const fetch = global.fetch || (await import('node-fetch')).default;
 
-
-console.log('🔄 Loaded api/order-creation v2');
+console.log('🔄 Loaded api/order-creation v3');
 
 const app = express();
 app.use(express.raw({ type: 'application/json' }));
+
+// Use global fetch (Node 18+)
+const fetch = globalThis.fetch;
+if (!fetch) console.warn('⚠️ fetch is not available globally');
 
 // 1) HMAC ellenőrzés
 function verifyShopifyWebhook(req) {
@@ -45,11 +47,10 @@ async function appendOrderToSheet(order) {
   const auth = new google.auth.GoogleAuth({
     credentials: {
       client_email: process.env.GOOGLE_CLIENT_EMAIL,
-      private_key:   process.env.GOOGLE_PRIVATE_KEY.replace(/\n/g,'\n'),
+      private_key:   process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g,'\n'),
     },
     scopes: ['https://www.googleapis.com/auth/spreadsheets']
   });
-  console.log('🔑 Authenticating to Google...');
   const client = await auth.getClient();
   const sheets = google.sheets({ version:'v4', auth: client });
 
@@ -90,7 +91,6 @@ async function appendOrderToSheet(order) {
     order.subtotal_price,
     order.total_price,
     order.total_tax,
-    order.currency,
     shippingAddress
   ];
   console.log('📋 Row to append:', row);
