@@ -3,7 +3,8 @@ require('dotenv').config();
 const express = require('express');
 const crypto = require('crypto');
 const { google } = require('googleapis');
-const fetch = require('undici').fetch;
+const fetch = global.fetch || (await import('node-fetch')).default;
+
 
 console.log('🔄 Loaded api/order-creation v2');
 
