@@ -71,19 +71,18 @@ async function appendOrderToSheet(order) {
     order.subtotal_price,
     order.total_price,
     order.total_tax,
-    order.currency,
-    order.financial_status,
-    order.fulfillment_status||'',
     addr
   ];
 
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: process.env.SPREADSHEET_ID,
-    range: `${process.env.SHEET_NAME}!A:T`,
-    valueInputOption: 'RAW',
-    insertDataOption: 'INSERT_ROWS',
-    resource: { values: [row] }
-  });
+await sheets.spreadsheets.values.append({
+  spreadsheetId: process.env.SPREADSHEET_ID,
+  // ez biztosan A oszloptól kezd és a 1. sortól lefelé írja be a következő üres sort:
+  range: `${process.env.SHEET_NAME}!A1:T`,
+  valueInputOption: 'RAW',
+  insertDataOption: 'INSERT_ROWS',
+  resource: { values: [row] }
+});
+
 }
 
 app.post('/webhook/order-creation', async (req, res) => {
