@@ -4,6 +4,7 @@ const express = require('express');
 const crypto = require('crypto');
 const bodyParser = require('body-parser');
 const { google } = require('googleapis');
+const { fetch } = require('undici');  // Use undici fetch to support CJS
 
 console.log('🔄 Loaded webhook-to-sheets v9');
 
@@ -45,6 +46,11 @@ async function appendOrderToSheet(order) {
   const phone = shipping.phone || order.phone || customer.phone || '';
 
   const products = order.line_items || [];
+
+  // Dynamically import fetch for ESM modules
+  const { default: fetch } = await import('node-fetch');
+
+  // Fetch cost per item for each variant via Shopify Admin API
 
   // Fetch cost per item for each variant via Shopify Admin API
   const shopDomain = process.env.SHOPIFY_SHOP_DOMAIN;
