@@ -4,9 +4,8 @@ const express = require('express');
 const crypto = require('crypto');
 const bodyParser = require('body-parser');
 const { google } = require('googleapis');
-const { fetch } = require('undici');  // Use undici for fetch in CJS
 
-console.log('🔄 Loaded webhook-to-sheets v11');
+console.log('🔄 Loaded webhook-to-sheets v11.1');
 
 const app = express();
 app.use(bodyParser.raw({ type: 'application/json' }));
@@ -32,18 +31,19 @@ function formatHuDate(iso) {
          ` ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-// Append order to sheet
 async function appendOrderToSheet(order) {
+  // Authenticate with Google
   const auth = new google.auth.GoogleAuth({
     credentials: {
       client_email: process.env.GOOGLE_CLIENT_EMAIL,
-      private_key: process.env.GOOGLE_PRIVATE_KEY.replace(/\n/g, ''),
+      private_key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
     },
     scopes: ['https://www.googleapis.com/auth/spreadsheets'],
   });
   const client = await auth.getClient();
   const sheets = google.sheets({ version: 'v4', auth: client });
 
+  // Extract relevant data
   const customer = order.customer || {};
   const shipping = order.shipping_address || {};
 
@@ -51,7 +51,7 @@ async function appendOrderToSheet(order) {
 
   const products = order.line_items || [];
   const totalQuantity = products.reduce((sum, i) => sum + (i.quantity || 0), 0);
-  // Product names separated by commas
+  // Product names separated by semicolons
   const productNames = products.map(i => i.title).join('; ');
   const productSkus = products.map(i => i.sku).join('; ');
   const productVendors = products.map(i => i.vendor).join('; ');
@@ -65,6 +65,7 @@ async function appendOrderToSheet(order) {
   if (shipping.address2) addressParts.push(shipping.address2);
   const shippingAddress = addressParts.join(', ');
 
+  // Build row
   const row = [
     order.id,                          // Order ID
     order.name,                        // Order number
