@@ -6,7 +6,7 @@ const bodyParser = require('body-parser');
 const { google } = require('googleapis');
 
 // Log version
-console.log('🔄 Loaded webhook-to-sheets v6');
+console.log('🔄 Loaded webhook-to-sheets v7');
 
 const app = express();
 app.use(bodyParser.raw({ type: 'application/json' }));
@@ -34,7 +34,6 @@ function formatHuDate(iso) {
 
 // Append order to sheet
 async function appendOrderToSheet(order) {
-  // Authenticate
   const auth = new google.auth.GoogleAuth({
     credentials: {
       client_email: process.env.GOOGLE_CLIENT_EMAIL,
@@ -45,26 +44,34 @@ async function appendOrderToSheet(order) {
   const client = await auth.getClient();
   const sheets = google.sheets({ version: 'v4', auth: client });
 
-  // Build row with requested fields
+  // Extract customer and shipping data
   const customer = order.customer || {};
   const shipping = order.shipping_address || {};
-  const lineItems = (order.line_items || [])
-    .map(i => `${i.title} (SKU: ${i.sku}) x${i.quantity}`)
-    .join(', ');
-
+  // Determine phone number
+  const phone = customer.phone || order.phone || '';
+  // Prepare product arrays
+  const products = order.line_items || [];
+  const productNames = products.map(i => i.title).join(', ');
+  const productSkus = products.map(i => i.sku).join(', ');
+  const productVendors = products.map(i => i.vendor).join(', ');
+  // Format shipping address with postal code
   const shippingAddress = shipping.zip
     ? `${shipping.zip}, ${shipping.city}, ${shipping.address1 || ''}`.trim()
     : `${shipping.city}, ${shipping.address1 || ''}`.trim();
 
+  // Build row in requested order, no gaps
   const row = [
+    phone,                          // Felhasználó telefonszáma
     order.id,
     order.name,
     order.customer_id || '',
     [customer.first_name, customer.last_name].filter(Boolean).join(' '),
     customer.email || '',
     formatHuDate(order.created_at),
-    (order.line_items || []).length,
-    lineItems,
+    products.length,
+    productNames,
+    productSkus,
+    productVendors,
     order.subtotal_price,
     order.total_price,
     order.total_tax,
@@ -78,7 +85,7 @@ async function appendOrderToSheet(order) {
 
   await sheets.spreadsheets.values.append({
     spreadsheetId: process.env.SPREADSHEET_ID,
-    range: `${process.env.SHEET_NAME}!A:O`,
+    range: `${process.env.SHEET_NAME}!A:R`,
     valueInputOption: 'RAW',
     insertDataOption: 'INSERT_ROWS',
     resource: { values: [row] },
