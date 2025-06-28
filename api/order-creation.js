@@ -34,15 +34,50 @@ function formatHuDate(iso) {
 
 // Append order to sheet
 async function appendOrderToSheet(order) {
-  const auth = new google.auth.GoogleAuth({
-    credentials: {
-      client_email: process.env.GOOGLE_CLIENT_EMAIL,
-      private_key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-    },
-    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-  });
-  const client = await auth.getClient();
-  const sheets = google.sheets({ version: 'v4', auth: client });
+  // Extract customer and shipping data
+  const customer = order.customer || {};
+  const shipping = order.shipping_address || {};
+  const billing = order.billing_address || {};
+
+  // Determine phone number: shipping, billing, or order/contact
+  const phone = shipping.phone || billing.phone || order.phone || customer.phone || '';
+
+  // Prepare product arrays
+  const products = order.line_items || [];
+  const productNames = products.map(i => i.title).join(', ');
+  const productSkus = products.map(i => i.sku).join(', ');
+  const productVendors = products.map(i => i.vendor).join(', ');
+
+  // Format shipping address with postal code
+  const shippingAddress = shipping.zip
+    ? `${shipping.zip}, ${shipping.city}, ${shipping.address1 || ''}`.trim()
+    : `${shipping.city}, ${shipping.address1 || ''}`.trim();
+
+  // Build row in requested order, no gaps
+  const row = [
+    phone,                          // Felhasználó telefonszáma
+    order.id,                       // Order ID
+    order.name,                     // Order number
+    customer.id || '',              // Customer ID
+    [customer.first_name, customer.last_name].filter(Boolean).join(' '), // Name
+    customer.email || '',           // Email
+    formatHuDate(order.created_at), // Dátum
+    products.length,                // Termékek száma
+    productNames,                   // Termék nevek
+    productSkus,                    // SKU-k
+    productVendors,                 // Vendorok
+    order.subtotal_price,           // Subtotal
+    order.total_price,              // Total
+    order.total_tax,                // Total Tax
+    order.currency,                 // Currency
+    order.financial_status,         // Financial status
+    order.fulfillment_status || '', // Fulfillment status
+    shippingAddress                 // Szállítási cím
+  ];
+
+  console.log('📋 Appending row:', row);
+
+  await sheets.spreadsheets.values.append({({ version: 'v4', auth: client });
 
   // Extract customer and shipping data
   const customer = order.customer || {};
