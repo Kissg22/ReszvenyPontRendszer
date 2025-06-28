@@ -1,9 +1,17 @@
-//api/order-adjut.js
+// api/order-adjust.js
 require('dotenv').config();
 const crypto = require('crypto');
-const { fetch } = require('undici');
+// Use global fetch (Node 18+)
+const fetch = global.fetch;
+if (!fetch) console.warn('⚠️ global fetch is not available.');
 
-// Shared endpoint for handling refund adjustments (partial and full)
+// Helper to read raw body
+async function getRawBody(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
+
 module.exports = async (req, res) => {
   console.log('▶️  /order-adjust endpoint hit');
 
@@ -24,10 +32,13 @@ module.exports = async (req, res) => {
   }
 
   const hmacHeader = req.headers['x-shopify-hmac-sha256'];
-  const computedHmac = crypto.createHmac('sha256', process.env.SHOPIFY_API_SECRET_KEY)
+  const computedHmac = crypto
+    .createHmac('sha256', process.env.SHOPIFY_API_SECRET_KEY)
     .update(buf)
     .digest('base64');
 
+  console.log('🔐 Received HMAC:', hmacHeader);
+  console.log('🔑 Computed HMAC:', computedHmac);
   if (!hmacHeader || hmacHeader !== computedHmac) {
     console.error('❌ HMAC validation failed');
     return res.writeHead(401).end('HMAC validation failed');
@@ -99,7 +110,7 @@ module.exports = async (req, res) => {
   const orderMetaQuery = `
     query getOrderMeta($id: ID!) {
       order(id: $id) {
-        subtotalMeta: metafield(namespace: \"custom\", key: \"subtotal\") { value }
+        subtotalMeta: metafield(namespace: "custom", key: "subtotal") { value }
       }
     }
   `;
@@ -113,8 +124,7 @@ module.exports = async (req, res) => {
       },
       body: JSON.stringify({ query: orderMetaQuery, variables: { id: `gid://shopify/Order/${orderId}` } })
     });
-    const { data, errors } = await resp.json();
-    if (errors?.length) throw errors;
+    const { data } = await resp.json();
     prevOrderSubtotal = Number(data.order.subtotalMeta?.value || 0);
     console.log(`🔍 Previous order subtotal: ${prevOrderSubtotal.toFixed(2)}`);
   } catch (err) {
@@ -124,16 +134,16 @@ module.exports = async (req, res) => {
 
   // Calculate new order values
   const newOrderSubtotal = prevOrderSubtotal - adjustAmount;
-  const newOrderShares = Math.floor(newOrderSubtotal / shareUnit);
-  const newOrderRemainder = newOrderSubtotal % shareUnit;
+  const newOrderShares   = Math.floor(newOrderSubtotal / shareUnit);
+  const newOrderRemainder= newOrderSubtotal % shareUnit;
   console.log('📦 Computed new order meta:', { newOrderSubtotal, newOrderShares, newOrderRemainder });
 
   // 7) Fetch existing customer loyalty meta
   const customerMetaQuery = `
     query getCustomerMeta($id: ID!) {
       customer(id: $id) {
-        netSpent: metafield(namespace: \"loyalty\", key: \"net_spent_total\") { value }
-        shareCount: metafield(namespace: \"loyalty\", key: \"reszvenyek_szama\") { value }
+        netSpent: metafield(namespace: "loyalty", key: "net_spent_total") { value }
+        shareCount: metafield(namespace: "loyalty", key: "reszvenyek_szama") { value }
       }
     }
   `;
@@ -147,8 +157,7 @@ module.exports = async (req, res) => {
       },
       body: JSON.stringify({ query: customerMetaQuery, variables: { id: `gid://shopify/Customer/${custId}` } })
     });
-    const { data, errors } = await resp.json();
-    if (errors?.length) throw errors;
+    const { data } = await resp.json();
     prevSpent = Number(data.customer.netSpent?.value || 0);
     console.log(`🔍 Previous customer spent: ${prevSpent.toFixed(2)}`);
   } catch (err) {
@@ -157,12 +166,12 @@ module.exports = async (req, res) => {
   }
 
   // Calculate new customer loyalty
-  const newCustSpent = prevSpent - adjustAmount;
-  const newCustShares = Math.floor(newCustSpent / shareUnit);
-  const newCustRemainder = newCustSpent % shareUnit;
+  const newCustSpent    = prevSpent - adjustAmount;
+  const newCustShares   = Math.floor(newCustSpent / shareUnit);
+  const newCustRemainder= newCustSpent % shareUnit;
   console.log('🔢 Computed new customer loyalty:', { newCustSpent, newCustShares, newCustRemainder });
 
-  // 8) Prepare mutation to update both customer and order metafields
+  // 8) Prepare mutation
   const mutation = `
     mutation Adjust($custInput: CustomerInput!, $orderInput: OrderInput!) {
       customerUpdate(input: $custInput) { userErrors { field message } }
@@ -173,7 +182,7 @@ module.exports = async (req, res) => {
   const custInput = {
     id: `gid://shopify/Customer/${custId}`,
     metafields: [
-      { namespace: 'loyalty', key: 'net_spent_total', type: 'number_decimal', value: newCustSpent.toFixed(2) },
+      { namespace: 'loyalty', key: 'net_spent_total',  type: 'number_decimal', value: newCustSpent.toFixed(2) },
       { namespace: 'loyalty', key: 'reszvenyek_szama', type: 'number_integer', value: String(newCustShares) },
       { namespace: 'custom',  key: 'jelenlegi_fennmarado', type: 'number_decimal', value: newCustRemainder.toFixed(2) }
     ]
@@ -182,9 +191,9 @@ module.exports = async (req, res) => {
   const orderInput = {
     id: `gid://shopify/Order/${orderId}`,
     metafields: [
-      { namespace: 'custom', key: 'subtotal',        type: 'number_decimal',  value: newOrderSubtotal.toFixed(2) },
-      { namespace: 'custom', key: 'order_share',     type: 'number_integer',  value: String(newOrderShares) },
-      { namespace: 'custom', key: 'order_remainder', type: 'number_decimal',  value: newOrderRemainder.toFixed(2) }
+      { namespace: 'custom', key: 'subtotal',        type: 'number_decimal', value: newOrderSubtotal.toFixed(2) },
+      { namespace: 'custom', key: 'order_share',     type: 'number_integer', value: String(newOrderShares) },
+      { namespace: 'custom', key: 'order_remainder', type: 'number_decimal', value: newOrderRemainder.toFixed(2) }
     ]
   };
 
@@ -217,10 +226,3 @@ module.exports = async (req, res) => {
   console.log('🏁 /order-adjust finished');
   res.writeHead(200).end('OK');
 };
-
-// Helper to read raw body
-async function getRawBody(req) {
-  const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
-  return Buffer.concat(chunks);
-}
