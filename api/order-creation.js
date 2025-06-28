@@ -45,37 +45,11 @@ async function appendOrderToSheet(order) {
   const phone = shipping.phone || order.phone || customer.phone || '';
 
   const products = order.line_items || [];
-
-  // Fetch cost per item for each variant via Shopify Admin API
-  const shopDomain = process.env.SHOPIFY_SHOP_DOMAIN;
-  const accessToken = process.env.SHOPIFY_ACCESS_TOKEN;
-  const fetch = require('node-fetch');
-  const variantCosts = await Promise.all(products.map(async item => {
-    try {
-      const res = await fetch(
-        `https://${shopDomain}/admin/api/2025-01/variants/${item.variant_id}.json`,
-        {
-          headers: {
-            'X-Shopify-Access-Token': accessToken,
-            'Content-Type': 'application/json'
-          }
-        }
-      );
-      const { variant } = await res.json();
-      return variant.inventory_item_id && variant.cost ? parseFloat(variant.cost) : 0;
-    } catch (e) {
-      console.error('Error fetching variant cost:', e);
-      return 0;
-    }
-  }));
-  
   const totalQuantity = products.reduce((sum, i) => sum + (i.quantity || 0), 0);
   const productNames = products.map(i => i.title).join('; ');
   const productSkus = products.map(i => i.sku).join('; ');
   const productVendors = products.map(i => i.vendor).join('; ');
-  const costPerItem = variantCosts.join('; ');
-  const lineTotals = products.map((i, idx) => (parseFloat(i.price) * i.quantity).toFixed(2)).join('; ');
-  const costLineTotals = variantCosts.map((cost, idx) => (cost * products[idx].quantity).toFixed(2)).join('; ');(i => (parseFloat(i.price) * i.quantity).toFixed(2)).join('; ');
+  const lineTotals = products.map(i => (parseFloat(i.price) * i.quantity).toFixed(2)).join('; ');
 
   const shippingAddress = shipping.zip
     ? `${shipping.zip}, ${shipping.city}, ${shipping.address1 || ''}`.trim()
