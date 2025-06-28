@@ -6,7 +6,7 @@ const bodyParser = require('body-parser');
 const { google } = require('googleapis');
 
 // Log version
-console.log('🔄 Loaded webhook-to-sheets v5');
+console.log('🔄 Loaded webhook-to-sheets v6');
 
 const app = express();
 app.use(bodyParser.raw({ type: 'application/json' }));
@@ -45,11 +45,16 @@ async function appendOrderToSheet(order) {
   const client = await auth.getClient();
   const sheets = google.sheets({ version: 'v4', auth: client });
 
-  // Build row with all fields
+  // Build row with requested fields
   const customer = order.customer || {};
   const shipping = order.shipping_address || {};
-  const billing = order.billing_address || {};
-  const lineItems = (order.line_items || []).map(i => `${i.title} x${i.quantity}`).join('; ');
+  const lineItems = (order.line_items || [])
+    .map(i => `${i.title} (SKU: ${i.sku}) x${i.quantity}`)
+    .join(', ');
+
+  const shippingAddress = shipping.zip
+    ? `${shipping.zip}, ${shipping.city}, ${shipping.address1 || ''}`.trim()
+    : `${shipping.city}, ${shipping.address1 || ''}`.trim();
 
   const row = [
     order.id,
@@ -57,7 +62,6 @@ async function appendOrderToSheet(order) {
     order.customer_id || '',
     [customer.first_name, customer.last_name].filter(Boolean).join(' '),
     customer.email || '',
-    order.created_at,
     formatHuDate(order.created_at),
     (order.line_items || []).length,
     lineItems,
@@ -67,19 +71,14 @@ async function appendOrderToSheet(order) {
     order.currency,
     order.financial_status,
     order.fulfillment_status || '',
-    shipping.name || '',
-    `${shipping.address1 || ''} ${shipping.city || ''}`.trim(),
-    billing.name || '',
-    `${billing.address1 || ''} ${billing.city || ''}`.trim(),
-    order.tags,
-    order.note || ''
+    shippingAddress
   ];
 
   console.log('📋 Appending row:', row);
 
   await sheets.spreadsheets.values.append({
     spreadsheetId: process.env.SPREADSHEET_ID,
-    range: `${process.env.SHEET_NAME}!A:U`,
+    range: `${process.env.SHEET_NAME}!A:O`,
     valueInputOption: 'RAW',
     insertDataOption: 'INSERT_ROWS',
     resource: { values: [row] },
@@ -88,14 +87,11 @@ async function appendOrderToSheet(order) {
   console.log(`✅ Order ${order.id} appended with ${row.length} columns`);
 }
 
-// Webhook endpoint
 app.post('/webhook/order-creation', async (req, res) => {
   try {
     if (!verifyShopifyWebhook(req)) return res.status(401).send('Unauthorized');
-
     const order = JSON.parse(req.body.toString('utf8'));
     console.log('📦 Full Order Payload:', JSON.stringify(order, null, 2));
-
     await appendOrderToSheet(order);
     res.status(200).send('OK');
   } catch (e) {
@@ -104,6 +100,5 @@ app.post('/webhook/order-creation', async (req, res) => {
   }
 });
 
-// Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Listening on ${PORT}`));
