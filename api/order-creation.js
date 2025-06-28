@@ -81,8 +81,6 @@ async function appendOrderToSheet(order) {
     order.total_price,              // Total
     order.total_tax,                // Total Tax
     order.currency,                 // Currency
-    order.financial_status,         // Financial status
-    order.fulfillment_status || '', // Fulfillment status
     shippingAddress                 // Szállítási cím
   ];
 
