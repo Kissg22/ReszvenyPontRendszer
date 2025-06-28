@@ -106,7 +106,7 @@ async function appendOrderToSheet(order) {
 }
 
 // 4) Webhook handler
-app.post('/order-creation', async (req, res) => {
+app.post('/webhook/order-creation', async (req, res) => {
   console.log('▶️  /order-creation endpoint hit');
   try {
     if (!verifyShopifyWebhook(req)) {
