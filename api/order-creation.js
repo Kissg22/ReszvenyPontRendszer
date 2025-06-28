@@ -4,9 +4,9 @@ const express = require('express');
 const crypto = require('crypto');
 const bodyParser = require('body-parser');
 const { google } = require('googleapis');
-const { fetch } = require('undici');  // Use undici fetch to support CJS
+const { fetch } = require('undici');  // Use undici's fetch for CommonJS compatibility
 
-console.log('🔄 Loaded webhook-to-sheets v9');
+console.log('🔄 Loaded webhook-to-sheets v10');
 
 const app = express();
 app.use(bodyParser.raw({ type: 'application/json' }));
@@ -30,6 +30,7 @@ function formatHuDate(iso) {
 }
 
 async function appendOrderToSheet(order) {
+  // Authenticate with Google
   const auth = new google.auth.GoogleAuth({
     credentials: {
       client_email: process.env.GOOGLE_CLIENT_EMAIL,
@@ -40,54 +41,45 @@ async function appendOrderToSheet(order) {
   const client = await auth.getClient();
   const sheets = google.sheets({ version: 'v4', auth: client });
 
+  // Extract relevant data
   const customer = order.customer || {};
   const shipping = order.shipping_address || {};
-
   const phone = shipping.phone || order.phone || customer.phone || '';
 
   const products = order.line_items || [];
-
-  // Dynamically import fetch for ESM modules
-  const { default: fetch } = await import('node-fetch');
-
-  // Fetch cost per item for each variant via Shopify Admin API
+  // Sum quantities correctly
+  const totalQuantity = products.reduce((sum, i) => sum + (i.quantity || 0), 0);
+  const productNames = products.map(i => i.title).join('; ');
+  const productSkus = products.map(i => i.sku).join('; ');
+  const productVendors = products.map(i => i.vendor).join('; ');
 
   // Fetch cost per item for each variant via Shopify Admin API
   const shopDomain = process.env.SHOPIFY_SHOP_DOMAIN;
   const accessToken = process.env.SHOPIFY_ACCESS_TOKEN;
-  const fetch = require('node-fetch');
-  const variantCosts = await Promise.all(products.map(async item => {
+  const costs = await Promise.all(products.map(async item => {
     try {
       const res = await fetch(
         `https://${shopDomain}/admin/api/2025-01/variants/${item.variant_id}.json`,
-        {
-          headers: {
+        { headers: {
             'X-Shopify-Access-Token': accessToken,
             'Content-Type': 'application/json'
-          }
-        }
+          } }
       );
-      const { variant } = await res.json();
-      return variant.inventory_item_id && variant.cost ? parseFloat(variant.cost) : 0;
+      const data = await res.json();
+      return parseFloat(data.variant.cost) || 0;
     } catch (e) {
       console.error('Error fetching variant cost:', e);
       return 0;
     }
   }));
-  
-  const totalQuantity = products.reduce((sum, i) => sum + (i.quantity || 0), 0);
-  const productNames = products.map(i => i.title).join('; ');
-  const productSkus = products.map(i => i.sku).join('; ');
-  const productVendors = products.map(i => i.vendor).join('; ');
-  const unitPrices = products.map(i => i.price).join('; ');
-  const costPerItem = variantCosts.join('; ');
-  const lineTotals = products.map((i, idx) => (parseFloat(i.price) * i.quantity).toFixed(2)).join('; ');
-  const costLineTotals = variantCosts.map((cost, idx) => (cost * products[idx].quantity).toFixed(2)).join('; ');(i => (parseFloat(i.price) * i.quantity).toFixed(2)).join('; ');
+  const costPerItem = costs.map(c => c.toFixed(2)).join('; ');
+  const profitPerItem = products.map((i, idx) => ((parseFloat(i.price) - costs[idx]) * i.quantity).toFixed(2)).join('; ');
 
   const shippingAddress = shipping.zip
     ? `${shipping.zip}, ${shipping.city}, ${shipping.address1 || ''}`.trim()
     : `${shipping.city}, ${shipping.address1 || ''}`.trim();
 
+  // Build row
   const row = [
     phone,
     customer.id || '',
@@ -100,12 +92,14 @@ async function appendOrderToSheet(order) {
     productNames,
     productSkus,
     productVendors,
-    unitPrices,
-    lineTotals,
+    costPerItem,
+    profitPerItem,
     order.subtotal_price,
     order.total_price,
     order.total_tax,
     order.currency,
+    order.financial_status,
+    order.fulfillment_status || '',
     shippingAddress
   ];
 
