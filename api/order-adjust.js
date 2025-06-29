@@ -58,10 +58,9 @@ async function adjustSheet(orderId, subtotal, total, tax) {
     range: `${sheet}!Q${row}`,
   })).data;
   const prev = Q?.[0]?.[0] || '';
-  const now = new Date();
-  now.setHours(now.getHours() + 2);
-  const pad = (n) => String(n).padStart(2, '0');
-  const ts = `${now.getFullYear()}.${pad(now.getMonth() + 1)}.${pad(now.getDate())}` +
+  const now = new Date(); now.setHours(now.getHours()+2);
+  const pad = (n) => String(n).padStart(2,'0');
+  const ts = `${now.getFullYear()}.${pad(now.getMonth()+1)}.${pad(now.getDate())}` +
              ` ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
   const note = `módosítva: ${ts}`;
   const updated = prev ? `${prev}; ${note}` : note;
@@ -84,51 +83,34 @@ module.exports = async (req, res) => {
 
   // raw body + HMAC
   let buf;
-  try {
-    buf = await getRawBody(req);
-  } catch {
-    return res.writeHead(400).end('Invalid body');
-  }
-  if (!verifyShopifyWebhook(req, buf)) {
-    return res.writeHead(401).end('Unauthorized');
-  }
+  try { buf = await getRawBody(req) } catch { return res.writeHead(400).end('Invalid body') }
+  if (!verifyShopifyWebhook(req, buf)) return res.writeHead(401).end('Unauthorized');
 
   // parse payload
   let payload;
-  try {
-    payload = JSON.parse(buf.toString());
-  } catch {
-    return res.writeHead(400).end('Invalid JSON');
-  }
+  try { payload = JSON.parse(buf.toString()) } catch { return res.writeHead(400).end('Invalid JSON') }
 
   // detect event
   const topicHeader = req.headers['x-shopify-topic'] || '';
   const topic = topicHeader.trim().toLowerCase();
   console.log('Webhook topic:', topicHeader);
-  
   const isCancel = topic === 'orders/cancelled';
-  const hasRefund = Boolean(
-    payload.refund_line_items || payload.refunds?.flatMap((r) => r.refund_line_items || []).length
-  );
-  if (!isCancel && !hasRefund) {
-    console.log('ℹ️ Nem cancel vagy refund esemény, skip.');
-    return res.writeHead(200).end('Ignored');
-  }
+  const hasRefund = Boolean(payload.refund_line_items || payload.refunds?.flatMap(r => r.refund_line_items || []).length);
+  if (!isCancel && !hasRefund) return res.writeHead(200).end('Ignored');
 
   // order + customer IDs
   const orderId = payload.order_id || payload.id;
   if (!orderId) return res.writeHead(400).end('Missing order ID');
 
-  // ensure we have customer GID
+  // ensure customer GID
   let custGid = payload.customer?.id;
   if (!custGid) {
     try {
-      const r = await fetch(
-        `https://${process.env.SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/${process.env.SHOPIFY_API_VERSION}/orders/${orderId}.json?fields=customer`,
-        { headers: { 'X-Shopify-Access-Token': process.env.SHOPIFY_API_ACCESS_TOKEN } }
-      );
+      const r = await fetch(`https://${process.env.SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/${process.env.SHOPIFY_API_VERSION}/orders/${orderId}.json?fields=customer`, {
+        headers: {'X-Shopify-Access-Token': process.env.SHOPIFY_API_ACCESS_TOKEN}
+      });
       custGid = (await r.json()).order?.customer?.id;
-    } catch {}
+    } catch{};
   }
   if (!custGid) return res.writeHead(400).end('No customer ID');
   const custId = String(custGid).split('/').pop();
@@ -136,110 +118,83 @@ module.exports = async (req, res) => {
   const gqlUrl = `https://${process.env.SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/${process.env.SHOPIFY_API_VERSION}/graphql.json`;
   const shareUnit = Number(process.env.SHARE_UNIT);
 
-  // --- fetch prev metafields & current REST ---
+  // fetch prev metafields & current REST
   const multiQ = `
     query($oid:ID!,$cid:ID!){
-      order: order(id:$oid){ subtotal: metafield(namespace:\"custom\",key:\"subtotal\"){value} }
-      customer: customer(id:$cid){ spent: metafield(namespace:\"loyalty\",key:\"net_spent_total\"){value} }
+      order: order(id:$oid){
+        subtotal: metafield(namespace:\"custom\",key:\"subtotal\"){value}
+        refunded: metafield(namespace:\"custom\",key:\"refunded_amount\"){value}
+      }
+      customer: customer(id:$cid){spent: metafield(namespace:\"loyalty\",key:\"net_spent_total\"){value}}
     }`;
+
   const [prevRes, currRes] = await Promise.all([
-    fetch(gqlUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': process.env.SHOPIFY_API_ACCESS_TOKEN,
-      },
-      body: JSON.stringify({ query: multiQ, variables: { oid: `gid://shopify/Order/${orderId}`, cid: `gid://shopify/Customer/${custId}` } }),
+    fetch(gqlUrl, { method:'POST', headers:{'Content-Type':'application/json','X-Shopify-Access-Token':process.env.SHOPIFY_API_ACCESS_TOKEN},
+      body: JSON.stringify({ query: multiQ, variables:{ oid:`gid://shopify/Order/${orderId}`, cid:`gid://shopify/Customer/${custId}` } })
     }),
-    fetch(
-      `https://${process.env.SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/${process.env.SHOPIFY_API_VERSION}/orders/${orderId}.json?fields=current_subtotal_price,current_total_price,current_total_tax`,
-      { headers: { 'X-Shopify-Access-Token': process.env.SHOPIFY_API_ACCESS_TOKEN } }
-    ),
+    fetch(`https://${process.env.SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/${process.env.SHOPIFY_API_VERSION}/orders/${orderId}.json?fields=current_subtotal_price,current_total_price,current_total_tax`,
+      { headers:{ 'X-Shopify-Access-Token': process.env.SHOPIFY_API_ACCESS_TOKEN } }
+    )
   ]);
+
   const prevJson = await prevRes.json();
-  let prevSub = Number(prevJson.data.order.subtotal?.value || 0);
-  // if no metafield yet, fallback to payload price
-  if (prevSub === 0 && payload.current_subtotal_price) {
-    prevSub = parseFloat(payload.current_subtotal_price);
-  }
-  const prevSpent = Number(prevJson.data.customer.spent?.value || 0);
-  let currJson = await currRes.json();
+  let prevSub = parseFloat(prevJson.data.order.subtotal?.value || 0);
+  let prevRefunded = parseFloat(prevJson.data.order.refunded?.value || 0);
+  const prevSpent = parseFloat(prevJson.data.customer.spent?.value || 0);
+
+  const currJson = await currRes.json();
   let currSub = parseFloat(currJson.order.current_subtotal_price);
   let currTot = parseFloat(currJson.order.current_total_price);
   let currTax = parseFloat(currJson.order.current_total_tax);
 
-  // --- cancel event: zero out remaining values ---
+  // cancel: zero out
   if (isCancel) {
-    // if partial refund happened before, override prevSub to original order total
-    if (hasRefund && payload.total_price) {
-      const orig = parseFloat(payload.total_price);
-      console.log(`ℹ️ Partial refund then cancel: overriding prevSub to original total ${orig}`);
-      prevSub = orig;
-    }
-    console.log('ℹ️ Cancellation: zeroing order values');
-    currSub = 0;
-    currTot = 0;
-    currTax = 0;
-  }
-  if (isCancel && !hasRefund) {
-    console.log('ℹ️ Cancellation without refund: zeroing order values');
     currSub = 0;
     currTot = 0;
     currTax = 0;
   }
 
-  // compute adjust = what to subtract
+  // compute amount to adjust
   const adjust = prevSub - currSub;
-  if (adjust <= 0) {
-    console.log('ℹ️ Nincs levonásra váró összeg, skip.');
-    return res.writeHead(200).end('No change');
-  }
+  if (adjust <= 0) return res.writeHead(200).end('No change');
 
   // new values
   const newSub = currSub;
   const newSharesOrder = Math.floor(newSub / shareUnit);
   const newRemOrder = newSub % shareUnit;
+
+  const newRefunded = prevRefunded + adjust;
+
   const newSpent = prevSpent - adjust;
   const newSharesCust = Math.floor(newSpent / shareUnit);
   const newRemCust = newSpent % shareUnit;
 
-  // log the update details
-  console.log(`✏️ Order ${orderId} subtotal changed: ${prevSub.toFixed(2)} -> ${newSub.toFixed(2)}`);
-  console.log(`✏️ Customer ${custId} spent changed: ${prevSpent.toFixed(2)} -> ${newSpent.toFixed(2)}`);
+  console.log(`✏️ Order ${orderId} subtotal: ${prevSub.toFixed(2)} -> ${newSub.toFixed(2)}`);
+  console.log(`✏️ Order refunded amount: ${prevRefunded.toFixed(2)} -> ${newRefunded.toFixed(2)}`);
+  console.log(`✏️ Customer ${custId} spent: ${prevSpent.toFixed(2)} -> ${newSpent.toFixed(2)}`);
 
-
-  // GraphQL mutation
+  // mutation
   const mutation = `
     mutation($c:CustomerInput!,$o:OrderInput!){
       customerUpdate(input:$c){userErrors{field message}}
       orderUpdate(input:$o){userErrors{field message}}
     }`;
+
   const vars = {
-    c: {
-      id: `gid://shopify/Customer/${custId}`,
-      metafields: [
-        { namespace: 'loyalty', key: 'net_spent_total', type: 'number_decimal', value: newSpent.toFixed(2) },
-        { namespace: 'loyalty', key: 'reszvenyek_szama', type: 'number_integer', value: newSharesCust.toString() },
-        { namespace: 'custom', key: 'jelenlegi_fennmarado', type: 'number_decimal', value: newRemCust.toFixed(2) },
-      ],
-    },
-    o: {
-      id: `gid://shopify/Order/${orderId}`,
-      metafields: [
-        { namespace: 'custom', key: 'subtotal', type: 'number_decimal', value: newSub.toFixed(2) },
-        { namespace: 'custom', key: 'order_share', type: 'number_integer', value: newSharesOrder.toString() },
-        { namespace: 'custom', key: 'order_remainder', type: 'number_decimal', value: newRemOrder.toFixed(2) },
-      ],
-    },
+    c: { id:`gid://shopify/Customer/${custId}`, metafields:[
+      {namespace:'loyalty',key:'net_spent_total',type:'number_decimal',value:newSpent.toFixed(2)},
+      {namespace:'loyalty',key:'reszvenyek_szama',type:'number_integer',value:newSharesCust.toString()},
+      {namespace:'custom',key:'jelenlegi_fennmarado',type:'number_decimal',value:newRemCust.toFixed(2)}
+    ]},
+    o: { id:`gid://shopify/Order/${orderId}`, metafields:[
+      {namespace:'custom',key:'subtotal',type:'number_decimal',value:newSub.toFixed(2)},
+      {namespace:'custom',key:'order_share',type:'number_integer',value:newSharesOrder.toString()},
+      {namespace:'custom',key:'order_remainder',type:'number_decimal',value:newRemOrder.toFixed(2)},
+      {namespace:'custom',key:'refunded_amount',type:'number_decimal',value:newRefunded.toFixed(2)}
+    ]}
   };
-  const mr = await fetch(gqlUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Shopify-Access-Token': process.env.SHOPIFY_API_ACCESS_TOKEN,
-    },
-    body: JSON.stringify({ query: mutation, variables: vars }),
-  });
+
+  const mr = await fetch(gqlUrl, { method:'POST', headers:{'Content-Type':'application/json','X-Shopify-Access-Token':process.env.SHOPIFY_API_ACCESS_TOKEN}, body:JSON.stringify({query:mutation,variables:vars}) });
   const mj = await mr.json();
   const errs = [...mj.data.customerUpdate.userErrors, ...mj.data.orderUpdate.userErrors];
   if (errs.length) {
