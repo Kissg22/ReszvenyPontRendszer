@@ -18,9 +18,9 @@ async function getRawBody(req) {
 function verifyShopifyWebhook(req, buf) {
   const secret = process.env.SHOPIFY_API_SECRET_KEY;
   if (!secret) throw new Error('Missing Shopify secret');
-  const hmacHeader = req.headers['x-shopify-hmac-sha256'];
+  const hmac = req.headers['x-shopify-hmac-sha256'];
   const digest = crypto.createHmac('sha256', secret).update(buf).digest('base64');
-  return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader));
+  return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmac));
 }
 
 // 2) Update Google Sheet: L=subtotal, M=total, N=tax, Q=“módosítva”
@@ -33,13 +33,11 @@ async function adjustSheet(orderId, subtotal, total, tax) {
     scopes: ['https://www.googleapis.com/auth/spreadsheets']
   });
   const sheets = google.sheets({ version:'v4', auth: await auth.getClient() });
-  const ssId  = process.env.SPREADSHEET_ID;
-  const sheet = process.env.SHEET_NAME;
+  const ssId = process.env.SPREADSHEET_ID, sheet = process.env.SHEET_NAME;
 
   // find row by A
   const { values: A } = (await sheets.spreadsheets.values.get({
-    spreadsheetId: ssId,
-    range: `${sheet}!A:A`
+    spreadsheetId: ssId, range: `${sheet}!A:A`
   })).data;
   const idx = (A||[]).findIndex(r => r[0] === String(orderId));
   if (idx < 0) return console.warn(`Order ${orderId} not in sheet`);
@@ -55,17 +53,15 @@ async function adjustSheet(orderId, subtotal, total, tax) {
 
   // fetch & append Q
   const { values: Q } = (await sheets.spreadsheets.values.get({
-    spreadsheetId: ssId,
-    range: `${sheet}!Q${row}`
+    spreadsheetId: ssId, range: `${sheet}!Q${row}`
   })).data;
   const prev = Q?.[0]?.[0] || '';
-  const now = new Date(); now.setHours(now.getHours() + 2);
-  const pad = n => String(n).padStart(2, '0');
-  const ts  = `${now.getFullYear()}.${pad(now.getMonth()+1)}.${pad(now.getDate())}` +
-              ` ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+  const now = new Date(); now.setHours(now.getHours()+2);
+  const pad = n => String(n).padStart(2,'0');
+  const ts = `${now.getFullYear()}.${pad(now.getMonth()+1)}.${pad(now.getDate())}` +
+             ` ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
   const note = `módosítva: ${ts}`;
   const updated = prev ? `${prev}; ${note}` : note;
-
   await sheets.spreadsheets.values.update({
     spreadsheetId: ssId,
     range: `${sheet}!Q${row}`,
@@ -83,41 +79,36 @@ module.exports = async (req, res) => {
     return res.writeHead(405, { Allow: 'POST' }).end('Method Not Allowed');
   }
 
-  // 1) raw body + HMAC
+  // raw body + HMAC
   let buf;
-  try {
-    buf = await getRawBody(req);
-  } catch {
-    return res.writeHead(400).end('Invalid body');
-  }
+  try { buf = await getRawBody(req) }
+  catch { return res.writeHead(400).end('Invalid body') }
   if (!verifyShopifyWebhook(req, buf)) {
     return res.writeHead(401).end('Unauthorized');
   }
 
-  // 2) parse payload
+  // parse payload
   let payload;
-  try {
-    payload = JSON.parse(buf.toString());
-  } catch {
-    return res.writeHead(400).end('Invalid JSON');
-  }
+  try { payload = JSON.parse(buf.toString()) }
+  catch { return res.writeHead(400).end('Invalid JSON') }
 
-  // 3) detect event type
-  const topic = req.headers['x-shopify-topic'] || req.headers['X-Shopify-Topic'];
+  // detect event
+  const topic = (req.headers['x-shopify-topic']||'').toLowerCase();
   const isCancel = topic === 'orders/cancelled';
-  const isRefund = Boolean(
+  const hasRefund = Boolean(
     payload.refund_line_items ||
     payload.refunds?.flatMap(r => r.refund_line_items || []).length
   );
-  if (!isCancel && !isRefund) {
-    console.log('ℹ️ Nem refund vagy cancel esemény, skip.');
+  if (!isCancel && !hasRefund) {
+    console.log('ℹ️ Nem cancel vagy refund esemény, skip.');
     return res.writeHead(200).end('Ignored');
   }
 
-  // 4) order + customer IDs
+  // order + customer IDs
   const orderId = payload.order_id || payload.id;
   if (!orderId) return res.writeHead(400).end('Missing order ID');
 
+  // ensure we have customer GID
   let custGid = payload.customer?.id;
   if (!custGid) {
     try {
@@ -125,9 +116,8 @@ module.exports = async (req, res) => {
         `https://${process.env.SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/${process.env.SHOPIFY_API_VERSION}/orders/${orderId}.json?fields=customer`,
         { headers: { 'X-Shopify-Access-Token': process.env.SHOPIFY_API_ACCESS_TOKEN } }
       );
-      const j = await r.json();
-      custGid = j.order?.customer?.id;
-    } catch {}
+      custGid = (await r.json()).order?.customer?.id;
+    } catch{}
   }
   if (!custGid) return res.writeHead(400).end('No customer ID');
   const custId = String(custGid).split('/').pop();
@@ -135,65 +125,54 @@ module.exports = async (req, res) => {
   const gql = `https://${process.env.SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/${process.env.SHOPIFY_API_VERSION}/graphql.json`;
   const shareUnit = Number(process.env.SHARE_UNIT);
 
-  // 5) fetch previous subtotal & spent from metafields
-  const orderQ = `
-    query($id:ID!){order(id:$id){
-      subtotal: metafield(namespace:"custom",key:"subtotal"){value}
-    }}`;
-  const om = await (await fetch(gql, {
-    method: 'POST',
-    headers: {
-      'Content-Type':'application/json',
-      'X-Shopify-Access-Token': process.env.SHOPIFY_API_ACCESS_TOKEN
-    },
-    body: JSON.stringify({ query: orderQ, variables: { id: `gid://shopify/Order/${orderId}` } })
-  })).json();
-  const prevSub = Number(om.data.order.subtotal?.value || 0);
+  // --- fetch prev metafields & current REST ---
+  // prevSub and prevSpent
+  const multiQ = `
+    query($oid:ID!,$cid:ID!){
+      order: order(id:$oid){ subtotal: metafield(namespace:"custom",key:"subtotal"){value} }
+      customer: customer(id:$cid){ spent: metafield(namespace:"loyalty",key:"net_spent_total"){value} }
+    }`;
+  const [prevRes, currRes] = await Promise.all([
+    fetch(gql, {
+      method:'POST',
+      headers:{
+        'Content-Type':'application/json',
+        'X-Shopify-Access-Token':process.env.SHOPIFY_API_ACCESS_TOKEN
+      },
+      body: JSON.stringify({
+        query: multiQ,
+        variables: { oid:`gid://shopify/Order/${orderId}`, cid:`gid://shopify/Customer/${custId}` }
+      })
+    }),
+    fetch(
+      `https://${process.env.SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/${process.env.SHOPIFY_API_VERSION}/orders/${orderId}.json?fields=current_subtotal_price,current_total_price,current_total_tax`,
+      { headers:{ 'X-Shopify-Access-Token':process.env.SHOPIFY_API_ACCESS_TOKEN } }
+    )
+  ]);
+  const prevJson = await prevRes.json();
+  const prevSub = Number(prevJson.data.order.subtotal?.value || 0);
+  const prevSpent = Number(prevJson.data.customer.spent?.value || 0);
+  const currJson = await currRes.json();
+  const currSub = parseFloat(currJson.order.current_subtotal_price);
+  const currTot = parseFloat(currJson.order.current_total_price);
+  const currTax = parseFloat(currJson.order.current_total_tax);
 
-  const custQ = `
-    query($id:ID!){customer(id:$id){
-      spent: metafield(namespace:"loyalty",key:"net_spent_total"){value}
-    }}`;
-  const cm = await (await fetch(gql, {
-    method: 'POST',
-    headers: {
-      'Content-Type':'application/json',
-      'X-Shopify-Access-Token': process.env.SHOPIFY_API_ACCESS_TOKEN
-    },
-    body: JSON.stringify({ query: custQ, variables: { id: `gid://shopify/Customer/${custId}` } })
-  })).json();
-  const prevSpent = Number(cm.data.customer.spent?.value || 0);
-
-  // 6) fetch **current** totals (partial refund & cancel után is helyes)
-  const orderRes = await fetch(
-    `https://${process.env.SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/${process.env.SHOPIFY_API_VERSION}/orders/${orderId}.json?fields=current_subtotal_price,current_total_price,current_total_tax`,
-    { headers: { 'X-Shopify-Access-Token': process.env.SHOPIFY_API_ACCESS_TOKEN } }
-  );
-  if (!orderRes.ok) {
-    console.error('❌ Order fetch failed', await orderRes.text());
-    return res.writeHead(500).end('Order fetch failed');
-  }
-  const { order } = await orderRes.json();
-  const currSub = parseFloat(order.current_subtotal_price);
-  const currTot = parseFloat(order.current_total_price);
-  const currTax = parseFloat(order.current_total_tax);
-
-  // 7) compute delta only once
+  // compute adjust = what to subtract
   const adjust = prevSub - currSub;
   if (adjust <= 0) {
-    console.log('ℹ️ Nincs további levonás, skip.');
+    console.log('ℹ️ Nincs levonásra váró összeg, skip.');
     return res.writeHead(200).end('No change');
   }
 
-  // 8) új metafield- és share-értékek
-  const newSub = currSub;
+  // new values
+  const newSub = currSub;                // for order
   const newSharesOrder = Math.floor(newSub / shareUnit);
   const newRemOrder = newSub % shareUnit;
-  const newSpent = prevSpent - adjust;
+  const newSpent = prevSpent - adjust;   // for customer
   const newSharesCust = Math.floor(newSpent / shareUnit);
   const newRemCust = newSpent % shareUnit;
 
-  // 9) GraphQL mutáció
+  // GraphQL mutation
   const mutation = `
     mutation($c:CustomerInput!,$o:OrderInput!){
       customerUpdate(input:$c){userErrors{field message}}
@@ -203,27 +182,27 @@ module.exports = async (req, res) => {
     c: {
       id: `gid://shopify/Customer/${custId}`,
       metafields: [
-        { namespace: 'loyalty', key: 'net_spent_total',     type: 'number_decimal', value: newSpent.toFixed(2) },
-        { namespace: 'loyalty', key: 'reszvenyek_szama',    type: 'number_integer', value: newSharesCust.toString() },
-        { namespace: 'custom',  key: 'jelenlegi_fennmarado',type: 'number_decimal', value: newRemCust.toFixed(2) }
+        { namespace:'loyalty', key:'net_spent_total',     type:'number_decimal',  value:newSpent.toFixed(2) },
+        { namespace:'loyalty', key:'reszvenyek_szama',    type:'number_integer',  value:newSharesCust.toString() },
+        { namespace:'custom',  key:'jelenlegi_fennmarado',type:'number_decimal',  value:newRemCust.toFixed(2) }
       ]
     },
     o: {
       id: `gid://shopify/Order/${orderId}`,
       metafields: [
-        { namespace: 'custom', key: 'subtotal',        type: 'number_decimal', value: newSub.toFixed(2) },
-        { namespace: 'custom', key: 'order_share',     type: 'number_integer', value: newSharesOrder.toString() },
-        { namespace: 'custom', key: 'order_remainder', type: 'number_decimal', value: newRemOrder.toFixed(2) }
+        { namespace:'custom', key:'subtotal',        type:'number_decimal',  value:newSub.toFixed(2) },
+        { namespace:'custom', key:'order_share',     type:'number_integer',  value:newSharesOrder.toString() },
+        { namespace:'custom', key:'order_remainder', type:'number_decimal',  value:newRemOrder.toFixed(2) }
       ]
     }
   };
   const mr = await fetch(gql, {
-    method: 'POST',
-    headers: {
+    method:'POST',
+    headers:{
       'Content-Type':'application/json',
-      'X-Shopify-Access-Token': process.env.SHOPIFY_API_ACCESS_TOKEN
+      'X-Shopify-Access-Token':process.env.SHOPIFY_API_ACCESS_TOKEN
     },
-    body: JSON.stringify({ query: mutation, variables: vars })
+    body: JSON.stringify({ query:mutation, variables:vars })
   });
   const mj = await mr.json();
   const errs = [
@@ -236,9 +215,9 @@ module.exports = async (req, res) => {
   }
   console.log('✅ Metafields updated');
 
-  // 10) Update Sheet a **current** adatokkal
+  // update sheet
   await adjustSheet(orderId, currSub, currTot, currTax);
-
   console.log('✅ Sheet updated');
+
   res.writeHead(200).end('OK');
 };
