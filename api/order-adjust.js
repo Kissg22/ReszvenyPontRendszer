@@ -3,237 +3,204 @@ require('dotenv').config();
 const crypto = require('crypto');
 const { google } = require('googleapis');
 
-// Node18+ globális fetch
+// Node18+ global fetch
 const fetch = global.fetch;
 if (!fetch) console.warn('⚠️ global fetch not available');
 
-// Raw body reader
+// Read raw body for HMAC
 async function getRawBody(req) {
   const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
+  for await (const c of req) chunks.push(c);
   return Buffer.concat(chunks);
 }
 
-// 1) HMAC ellenőrzés
+// 1) HMAC validation
 function verifyShopifyWebhook(req, buf) {
   const secret = process.env.SHOPIFY_API_SECRET_KEY;
-  if (!secret) throw new Error('Missing SHOPIFY_API_SECRET_KEY');
+  if (!secret) throw new Error('Missing Shopify secret');
   const hmacHeader = req.headers['x-shopify-hmac-sha256'];
-  const digest = crypto.createHmac('sha256', secret)
-                       .update(buf)
-                       .digest('base64');
+  const digest = crypto.createHmac('sha256', secret).update(buf).digest('base64');
   return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader));
 }
 
-// 2) Sheet frissítő függvény: megtalálja az orderId-t az A oszlopban, módosítja L–M mezőket, majd a végére “módosítva” sort tesz
-async function adjustSheet(orderId, newSubtotalPrice, newTotalPrice) {
+// 2) Update Google Sheet: L=subtotal, M=total, N=tax, Q=“módosítva”
+async function adjustSheet(orderId, subtotal, total, tax) {
   const auth = new google.auth.GoogleAuth({
     credentials: {
       client_email: process.env.GOOGLE_CLIENT_EMAIL,
-      private_key:   process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+      private_key:   process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g,'\n'),
     },
     scopes: ['https://www.googleapis.com/auth/spreadsheets']
   });
-  const client = await auth.getClient();
-  const sheets = google.sheets({ version: 'v4', auth: client });
+  const sheets = google.sheets({ version:'v4', auth: await auth.getClient() });
   const ssId  = process.env.SPREADSHEET_ID;
   const sheet = process.env.SHEET_NAME;
 
-  // 1) Megkeressük, melyik sorban van az orderId az A oszlopban
-  const { values: rowsA = [] } = (await sheets.spreadsheets.values.get({
-    spreadsheetId: ssId,
-    range: `${sheet}!A:A`
+  // find row by A
+  const { values: A } = (await sheets.spreadsheets.values.get({
+    spreadsheetId:ssId, range:`${sheet}!A:A`
   })).data;
-  const rowIndex = rowsA.findIndex(r => r[0] === String(orderId));
-  if (rowIndex === -1) {
-    console.warn(`⚠️ Order ID ${orderId} nem található a sheetben`);
-    return;
-  }
-  const targetRow = rowIndex + 1;
+  const idx = (A||[]).findIndex(r=>r[0]===String(orderId));
+  if (idx<0) return console.warn(`Order ${orderId} not in sheet`);
+  const row = idx+1;
 
-  // 2) Frissítjük az L (12.) és M (13.) oszlopot: subtotal_price és total_price
+  // update L,M,N
   await sheets.spreadsheets.values.update({
-    spreadsheetId: ssId,
-    range: `${sheet}!L${targetRow}:M${targetRow}`,
-    valueInputOption: 'RAW',
-    resource: {
-      values: [[
-        newSubtotalPrice.toFixed(2),
-        newTotalPrice.toFixed(2)
-      ]]
-    }
+    spreadsheetId:ssId,
+    range:`${sheet}!L${row}:N${row}`,
+    valueInputOption:'RAW',
+    resource:{ values:[[ subtotal.toFixed(2), total.toFixed(2), tax.toFixed(2) ]] }
   });
 
-  // 3) Frissítjük ugyanabban a sorban a Q (17.) oszlopot: "módosítva: ..." hozzáfűzéssel
-  const { values: prevQ = [] } = (await sheets.spreadsheets.values.get({
-    spreadsheetId: ssId,
-    range: `${sheet}!Q${targetRow}`
+  // fetch & append Q
+  const { values: Q } = (await sheets.spreadsheets.values.get({
+    spreadsheetId:ssId, range:`${sheet}!Q${row}`
   })).data;
-  const prevNote = prevQ[0]?.[0] || '';
-
-  const now = new Date(); now.setHours(now.getHours() + 2);
-  const pad = n => String(n).padStart(2,'0');
-  const ts = `${now.getFullYear()}.${pad(now.getMonth()+1)}.${pad(now.getDate())}`
-           + ` ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+  const prev = Q?.[0]?.[0]||'';
+  const now = new Date(); now.setHours(now.getHours()+2);
+  const pad = n=>String(n).padStart(2,'0');
+  const ts  = `${now.getFullYear()}.${pad(now.getMonth()+1)}.${pad(now.getDate())}` +
+              ` ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
   const note = `módosítva: ${ts}`;
-  const updatedQ = prevNote ? `${prevNote}; ${note}` : note;
+  const updated = prev ? `${prev}; ${note}` : note;
 
   await sheets.spreadsheets.values.update({
-    spreadsheetId: ssId,
-    range: `${sheet}!Q${targetRow}`,
-    valueInputOption: 'RAW',
-    resource: { values: [[ updatedQ ]] }
+    spreadsheetId:ssId,
+    range:`${sheet}!Q${row}`,
+    valueInputOption:'RAW',
+    resource:{ values:[[ updated ]] }
   });
 
-  console.log(`✅ Sor ${targetRow} frissítve: subtotal_price=${newSubtotalPrice}, total_price=${newTotalPrice}, Q="${note}"`);
+  console.log(`Sheet row ${row} updated (L–N,Q)`);
 }
 
-
 module.exports = async (req, res) => {
-  console.log('▶️  /order-adjust endpoint hit');
+  console.log('▶️  /order-adjust');
 
-  // Csak POST
-  if (req.method !== 'POST') {
-    return res.writeHead(405, { Allow: 'POST' }).end('Method Not Allowed');
+  if (req.method!=='POST') {
+    return res.writeHead(405, {Allow:'POST'}).end('Method Not Allowed');
   }
-
-  // Raw body + HMAC
   let buf;
-  try {
-    buf = await getRawBody(req);
-  } catch (e) {
-    console.error('❌ Error reading body:', e);
+  try { buf = await getRawBody(req) } catch {
     return res.writeHead(400).end('Invalid body');
   }
   if (!verifyShopifyWebhook(req, buf)) {
-    console.error('❌ HMAC validation failed');
     return res.writeHead(401).end('Unauthorized');
   }
-
-  // Parse payload
   let payload;
-  try {
-    payload = JSON.parse(buf.toString());
-  } catch (e) {
-    console.error('❌ Invalid JSON payload:', e);
+  try { payload = JSON.parse(buf.toString()) } catch {
     return res.writeHead(400).end('Invalid JSON');
   }
 
-  // Csak refund esemény
+  // only refunds
   const items = payload.refund_line_items
-             || payload.refunds?.flatMap(r => r.refund_line_items || []);
+              || payload.refunds?.flatMap(r=>r.refund_line_items||[]);
   if (!items?.length) {
-    return res.writeHead(200).end('No refund to adjust');
+    return res.writeHead(200).end('No refund');
   }
 
-  // Refund összeg
-  const adjustAmount = items.reduce((sum, li) => {
-    const amt = li.subtotal_set?.presentment_money?.amount
-              || li.subtotal
-              || 0;
-    return sum + Number(amt);
-  }, 0);
-  if (adjustAmount <= 0) {
+  // compute refund amount
+  const adjust = items.reduce((s,li)=>
+    s + Number(li.subtotal_set?.presentment_money?.amount||li.subtotal||0), 0
+  );
+  if (adjust<=0) {
     return res.writeHead(200).end('Zero refund');
   }
 
-  // Order ID és Customer GID
-  const orderId = payload.order_id || payload.id;
-  if (!orderId) {
-    console.error('❌ Missing order ID');
-    return res.writeHead(400).end('Missing order ID');
-  }
+  // order + customer IDs
+  const orderId = payload.order_id||payload.id;
+  if (!orderId) return res.writeHead(400).end('Missing order ID');
+
+  // fetch customer GID fallback
   let custGid = payload.customer?.id;
   if (!custGid) {
-    // fallback REST call…
     try {
-      const rsp = await fetch(
+      const r = await fetch(
         `https://${process.env.SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/${process.env.SHOPIFY_API_VERSION}/orders/${orderId}.json?fields=customer`,
-        { headers: { 'X-Shopify-Access-Token': process.env.SHOPIFY_API_ACCESS_TOKEN } }
+        { headers:{ 'X-Shopify-Access-Token':process.env.SHOPIFY_API_ACCESS_TOKEN } }
       );
-      const j = await rsp.json();
+      const j = await r.json();
       custGid = j.order?.customer?.id;
     } catch {}
   }
-  if (!custGid) {
-    console.error('❌ No customer ID');
-    return res.writeHead(400).end('No customer ID');
-  }
+  if (!custGid) return res.writeHead(400).end('No customer ID');
   const custId = String(custGid).split('/').pop();
-  const gqlUrl = `https://${process.env.SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/${process.env.SHOPIFY_API_VERSION}/graphql.json`;
+  const gql = `https://${process.env.SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/${process.env.SHOPIFY_API_VERSION}/graphql.json`;
   const shareUnit = Number(process.env.SHARE_UNIT);
 
-  // Lekérjük az order subtotal metafieldet
-  const orderMetaQ = `
-    query($id: ID!){order(id:$id){subtotalMeta: metafield(namespace:"custom",key:"subtotal"){value}}}
-  `;
-  const omr = await fetch(gqlUrl, {
+  // 1) fetch previous order.meta.subtotal
+  const orderQ = `
+    query($id:ID!){order(id:$id){
+      subtotal: metafield(namespace:"custom",key:"subtotal"){value}
+    }}`
+  ;
+  const om = await (await fetch(gql,{
     method:'POST',
     headers:{
       'Content-Type':'application/json',
       'X-Shopify-Access-Token':process.env.SHOPIFY_API_ACCESS_TOKEN
     },
-    body: JSON.stringify({ query: orderMetaQ, variables:{ id:`gid://shopify/Order/${orderId}` } })
-  });
-  const omj = await omr.json();
-  const prevOrderSubtotal = Number(omj.data.order.subtotalMeta?.value || 0);
+    body: JSON.stringify({ query:orderQ, variables:{ id:`gid://shopify/Order/${orderId}` } })
+  })).json();
+  const prevSub = Number(om.data.order.subtotal?.value||0);
 
-  // Új order értékek
-  const newOrderSubtotal = prevOrderSubtotal - adjustAmount;
-  const newOrderShares   = Math.floor(newOrderSubtotal / shareUnit);
+  // 2) compute new order values
+  const newSub = prevSub - adjust;
+  const newSharesOrder = Math.floor(newSub/ shareUnit);
+  const newRemOrder = newSub % shareUnit;
 
-  // Lekérjük a customer spendinget
-  const custMetaQ = `
-    query($id: ID!){customer(id:$id){
-      netSpent: metafield(namespace:"loyalty",key:"net_spent_total"){value}
-    }}
-  `;
-  const cmr = await fetch(gqlUrl, {
+  // 3) fetch previous customer.net_spent
+  const custQ = `
+    query($id:ID!){customer(id:$id){
+      spent: metafield(namespace:"loyalty",key:"net_spent_total"){value}
+    }}`
+  ;
+  const cm = await (await fetch(gql,{
     method:'POST',
     headers:{
       'Content-Type':'application/json',
       'X-Shopify-Access-Token':process.env.SHOPIFY_API_ACCESS_TOKEN
     },
-    body: JSON.stringify({ query: custMetaQ, variables:{ id:`gid://shopify/Customer/${custId}` } })
-  });
-  const cmj = await cmr.json();
-  const prevSpent = Number(cmj.data.customer.netSpent?.value || 0);
+    body: JSON.stringify({ query:custQ, variables:{ id:`gid://shopify/Customer/${custId}` } })
+  })).json();
+  const prevSpent = Number(cm.data.customer.spent?.value||0);
 
-  // Új customer érték
-  const newCustSpent  = prevSpent - adjustAmount;
-  const newCustShares = Math.floor(newCustSpent / shareUnit);
+  // 4) compute new customer values
+  const newSpent = prevSpent - adjust;
+  const newSharesCust = Math.floor(newSpent/ shareUnit);
+  const newRemCust = newSpent % shareUnit;
 
-  // Mutáció összeállítása
+  // 5) GraphQL mutation
   const mutation = `
     mutation($c:CustomerInput!,$o:OrderInput!){
       customerUpdate(input:$c){userErrors{field message}}
       orderUpdate(input:$o){userErrors{field message}}
-    }
-  `;
-  const variables = {
+    }`;
+  const vars = {
     c: {
       id: `gid://shopify/Customer/${custId}`,
-      metafields: [
-        { namespace:'loyalty', key:'net_spent_total',  type:'number_decimal', value:newCustSpent.toFixed(2) },
-        { namespace:'loyalty', key:'reszvenyek_szama', type:'number_integer', value:newCustShares.toString() }
+      metafields:[
+        { namespace:'loyalty', key:'net_spent_total',  type:'number_decimal', value:newSpent.toFixed(2) },
+        { namespace:'loyalty', key:'reszvenyek_szama', type:'number_integer', value:newSharesCust.toString() },
+        { namespace:'custom',  key:'jelenlegi_fennmarado', type:'number_decimal', value:newRemCust.toFixed(2) }
       ]
     },
     o: {
       id: `gid://shopify/Order/${orderId}`,
-      metafields: [
-        { namespace:'custom', key:'subtotal',    type:'number_decimal', value:newOrderSubtotal.toFixed(2) },
-        { namespace:'custom', key:'order_share', type:'number_integer', value:newOrderShares.toString() }
+      metafields:[
+        { namespace:'custom', key:'subtotal',        type:'number_decimal', value:newSub.toFixed(2) },
+        { namespace:'custom', key:'order_share',     type:'number_integer', value:newSharesOrder.toString() },
+        { namespace:'custom', key:'order_remainder', type:'number_decimal', value:newRemOrder.toFixed(2) }
       ]
     }
   };
-  // Mutáció futtatása
-  const mr = await fetch(gqlUrl, {
+  const mr = await fetch(gql,{
     method:'POST',
     headers:{
       'Content-Type':'application/json',
       'X-Shopify-Access-Token':process.env.SHOPIFY_API_ACCESS_TOKEN
     },
-    body: JSON.stringify({ query:mutation, variables })
+    body: JSON.stringify({ query:mutation, variables:vars })
   });
   const mj = await mr.json();
   const errs = [
@@ -241,17 +208,17 @@ module.exports = async (req, res) => {
     ...mj.data.orderUpdate.userErrors
   ];
   if (errs.length) {
-    console.error('❌ Mutation errors:', errs);
-    return res.writeHead(500).end('Adjustment error');
+    console.error('❌ Metafield mutation errors', errs);
+    return res.writeHead(500).end('Metafield update failed');
   }
-
   console.log('✅ Metafields updated');
-const originalTotalPrice = parseFloat(payload.total_price);
-const newTotalPrice      = originalTotalPrice - adjustAmount;
 
-await adjustSheet(orderId, newOrderSubtotal, newTotalPrice);
+  // 6) Finally: update Google Sheet L (subtotal_price), M (total_price), N (total_tax)
+  const subP = parseFloat(payload.subtotal_price);
+  const totP = parseFloat(payload.total_price);
+  const taxP = parseFloat(payload.total_tax);
+  await adjustSheet(orderId, subP, totP, taxP);
 
-
-  console.log('✅ Sheet adjusted');
+  console.log('✅ Sheet updated');
   res.writeHead(200).end('OK');
 };
