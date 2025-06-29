@@ -102,27 +102,22 @@ module.exports = async (req, res) => {
     return res.writeHead(400).end('Invalid JSON');
   }
 
-  // csak refund webhookok
-  const items = payload.refund_line_items
-              || payload.refunds?.flatMap(r => r.refund_line_items || []);
-  if (!items?.length) {
-    return res.writeHead(200).end('No refund');
-  }
-
-  // refund összeg
-  const adjust = items.reduce((sum, li) =>
-    sum + Number(li.subtotal_set?.presentment_money?.amount || li.subtotal || 0),
-    0
+  // 3) detect event type
+  const topic = req.headers['x-shopify-topic'] || req.headers['X-Shopify-Topic'];
+  const isCancel = topic === 'orders/cancelled';
+  const isRefund = Boolean(
+    payload.refund_line_items ||
+    payload.refunds?.flatMap(r => r.refund_line_items || []).length
   );
-  if (adjust <= 0) {
-    return res.writeHead(200).end('Zero refund');
+  if (!isCancel && !isRefund) {
+    console.log('ℹ️ Nem refund vagy cancel esemény, skip.');
+    return res.writeHead(200).end('Ignored');
   }
 
-  // order ID
+  // 4) order + customer IDs
   const orderId = payload.order_id || payload.id;
   if (!orderId) return res.writeHead(400).end('Missing order ID');
 
-  // Customer GID fallback
   let custGid = payload.customer?.id;
   if (!custGid) {
     try {
@@ -136,10 +131,11 @@ module.exports = async (req, res) => {
   }
   if (!custGid) return res.writeHead(400).end('No customer ID');
   const custId = String(custGid).split('/').pop();
+
   const gql = `https://${process.env.SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/${process.env.SHOPIFY_API_VERSION}/graphql.json`;
   const shareUnit = Number(process.env.SHARE_UNIT);
 
-  // --- GraphQL: előző subtotal és felhasználói spent lekérés ---
+  // 5) fetch previous subtotal & spent from metafields
   const orderQ = `
     query($id:ID!){order(id:$id){
       subtotal: metafield(namespace:"custom",key:"subtotal"){value}
@@ -168,15 +164,36 @@ module.exports = async (req, res) => {
   })).json();
   const prevSpent = Number(cm.data.customer.spent?.value || 0);
 
-  // új értékek számítása
-  const newSub = prevSub - adjust;
+  // 6) fetch **current** totals (partial refund & cancel után is helyes)
+  const orderRes = await fetch(
+    `https://${process.env.SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/${process.env.SHOPIFY_API_VERSION}/orders/${orderId}.json?fields=current_subtotal_price,current_total_price,current_total_tax`,
+    { headers: { 'X-Shopify-Access-Token': process.env.SHOPIFY_API_ACCESS_TOKEN } }
+  );
+  if (!orderRes.ok) {
+    console.error('❌ Order fetch failed', await orderRes.text());
+    return res.writeHead(500).end('Order fetch failed');
+  }
+  const { order } = await orderRes.json();
+  const currSub = parseFloat(order.current_subtotal_price);
+  const currTot = parseFloat(order.current_total_price);
+  const currTax = parseFloat(order.current_total_tax);
+
+  // 7) compute delta only once
+  const adjust = prevSub - currSub;
+  if (adjust <= 0) {
+    console.log('ℹ️ Nincs további levonás, skip.');
+    return res.writeHead(200).end('No change');
+  }
+
+  // 8) új metafield- és share-értékek
+  const newSub = currSub;
   const newSharesOrder = Math.floor(newSub / shareUnit);
   const newRemOrder = newSub % shareUnit;
   const newSpent = prevSpent - adjust;
   const newSharesCust = Math.floor(newSpent / shareUnit);
   const newRemCust = newSpent % shareUnit;
 
-  // 5) Metafield mutáció
+  // 9) GraphQL mutáció
   const mutation = `
     mutation($c:CustomerInput!,$o:OrderInput!){
       customerUpdate(input:$c){userErrors{field message}}
@@ -186,9 +203,9 @@ module.exports = async (req, res) => {
     c: {
       id: `gid://shopify/Customer/${custId}`,
       metafields: [
-        { namespace: 'loyalty', key: 'net_spent_total',    type: 'number_decimal', value: newSpent.toFixed(2) },
-        { namespace: 'loyalty', key: 'reszvenyek_szama',   type: 'number_integer', value: newSharesCust.toString() },
-        { namespace: 'custom',  key: 'jelenlegi_fennmarado', type: 'number_decimal', value: newRemCust.toFixed(2) }
+        { namespace: 'loyalty', key: 'net_spent_total',     type: 'number_decimal', value: newSpent.toFixed(2) },
+        { namespace: 'loyalty', key: 'reszvenyek_szama',    type: 'number_integer', value: newSharesCust.toString() },
+        { namespace: 'custom',  key: 'jelenlegi_fennmarado',type: 'number_decimal', value: newRemCust.toFixed(2) }
       ]
     },
     o: {
@@ -219,21 +236,8 @@ module.exports = async (req, res) => {
   }
   console.log('✅ Metafields updated');
 
-  // 6) Végül: a Shopify REST API-ból mindig a CURRENT összegeket kérjük le (refundok utáni státusz)
-  const orderRes = await fetch(
-    `https://${process.env.SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/${process.env.SHOPIFY_API_VERSION}/orders/${orderId}.json?fields=current_subtotal_price,current_total_price,current_total_tax`,
-    { headers: { 'X-Shopify-Access-Token': process.env.SHOPIFY_API_ACCESS_TOKEN } }
-  );
-  if (!orderRes.ok) {
-    console.error('❌ Order fetch failed', await orderRes.text());
-    return res.writeHead(500).end('Order fetch failed');
-  }
-  const { order } = await orderRes.json();
-  const subP = parseFloat(order.current_subtotal_price);
-  const totP = parseFloat(order.current_total_price);
-  const taxP = parseFloat(order.current_total_tax);
-
-  await adjustSheet(orderId, subP, totP, taxP);
+  // 10) Update Sheet a **current** adatokkal
+  await adjustSheet(orderId, currSub, currTot, currTax);
 
   console.log('✅ Sheet updated');
   res.writeHead(200).end('OK');
