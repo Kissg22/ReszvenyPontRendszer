@@ -157,7 +157,11 @@ module.exports = async (req, res) => {
     ),
   ]);
   const prevJson = await prevRes.json();
-  const prevSub = Number(prevJson.data.order.subtotal?.value || 0);
+  let prevSub = Number(prevJson.data.order.subtotal?.value || 0);
+  // if no metafield yet, fallback to payload price
+  if (prevSub === 0 && payload.current_subtotal_price) {
+    prevSub = parseFloat(payload.current_subtotal_price);
+  }
   const prevSpent = Number(prevJson.data.customer.spent?.value || 0);
   let currJson = await currRes.json();
   let currSub = parseFloat(currJson.order.current_subtotal_price);
