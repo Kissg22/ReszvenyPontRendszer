@@ -76,12 +76,12 @@ async function appendOrderToSheet(order) {
 
 await sheets.spreadsheets.values.append({
   spreadsheetId: process.env.SPREADSHEET_ID,
-  // ez biztosan A oszloptól kezd és a 1. sortól lefelé írja be a következő üres sort:
-  range: `${process.env.SHEET_NAME}!A1:T`,
+  range: `${process.env.SHEET_NAME}!A:T`,    // csak oszlopok, nincs sor
   valueInputOption: 'RAW',
   insertDataOption: 'INSERT_ROWS',
-  resource: { values: [row] }
+  resource: { values: [ row ] }
 });
+
 
 }
 
