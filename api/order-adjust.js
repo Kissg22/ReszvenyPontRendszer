@@ -22,7 +22,7 @@ function verifyShopifyWebhook(req, buf) {
   return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmac));
 }
 
-// 2) Update Google Sheet: L=subtotal, M=total, N=tax, Q="módosítva"
+// 2) Update Google Sheet: L=subtotal, M=total, N=tax, then write "módosítva" note in first empty cell
 async function adjustSheet(orderId, subtotal, total, tax) {
   const auth = new google.auth.GoogleAuth({
     credentials: {
@@ -36,42 +36,60 @@ async function adjustSheet(orderId, subtotal, total, tax) {
   const sheet = process.env.SHEET_NAME;
 
   // find row by A
-  const { values: A } = (await sheets.spreadsheets.values.get({
-    spreadsheetId: ssId,
-    range: `${sheet}!A:A`,
-  })).data;
-  const idx = (A || []).findIndex((r) => r[0] === String(orderId));
+  const getA = await sheets.spreadsheets.values.get({ spreadsheetId: ssId, range: `${sheet}!A:A` });
+  const A = getA.data.values || [];
+  const idx = A.findIndex(r => r[0] === String(orderId));
   if (idx < 0) return console.warn(`Order ${orderId} not in sheet`);
-  const row = idx + 1;
+  const rowNum = idx + 1;
 
   // update L,M,N
   await sheets.spreadsheets.values.update({
     spreadsheetId: ssId,
-    range: `${sheet}!L${row}:N${row}`,
+    range: `${sheet}!L${rowNum}:N${rowNum}`,
     valueInputOption: 'RAW',
     resource: { values: [[subtotal.toFixed(2), total.toFixed(2), tax.toFixed(2)]] },
   });
 
-  // fetch & append Q
-  const { values: Q } = (await sheets.spreadsheets.values.get({
+  // fetch full row to find first empty cell
+  const getRow = await sheets.spreadsheets.values.get({
     spreadsheetId: ssId,
-    range: `${sheet}!Q${row}`,
-  })).data;
-  const prev = Q?.[0]?.[0] || '';
-  const now = new Date(); now.setHours(now.getHours()+2);
-  const pad = (n) => String(n).padStart(2,'0');
+    range: `${sheet}!${rowNum}:${rowNum}`,
+  });
+  const cells = getRow.data.values ? getRow.data.values[0] : [];
+
+  // find first empty cell index
+  let emptyIdx = cells.findIndex(cell => !cell || cell === '');
+  if (emptyIdx < 0) emptyIdx = cells.length;
+
+  // convert to column letter
+  function colLetter(n) {
+    let s = '';
+    let num = n + 1;
+    while (num > 0) {
+      const mod = (num - 1) % 26;
+      s = String.fromCharCode(65 + mod) + s;
+      num = Math.floor((num - mod) / 26);
+    }
+    return s;
+  }
+  const col = colLetter(emptyIdx);
+
+  // prepare note
+  const now = new Date(); now.setHours(now.getHours() + 2);
+  const pad = n => String(n).padStart(2, '0');
   const ts = `${now.getFullYear()}.${pad(now.getMonth()+1)}.${pad(now.getDate())}` +
              ` ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
   const note = `módosítva: ${ts}`;
-  const updated = prev ? `${prev}; ${note}` : note;
+
+  // write note
   await sheets.spreadsheets.values.update({
     spreadsheetId: ssId,
-    range: `${sheet}!Q${row}`,
+    range: `${sheet}!${col}${rowNum}`,
     valueInputOption: 'RAW',
-    resource: { values: [[updated]] },
+    resource: { values: [[note]] },
   });
 
-  console.log(`Sheet row ${row} updated (L–N, Q)`);
+  console.log(`Sheet row ${rowNum} updated (L–N, note in ${col}${rowNum})`);
 }
 
 module.exports = async (req, res) => {
@@ -81,36 +99,39 @@ module.exports = async (req, res) => {
     return res.writeHead(405, { Allow: 'POST' }).end('Method Not Allowed');
   }
 
-  // raw body + HMAC
   let buf;
-  try { buf = await getRawBody(req) } catch { return res.writeHead(400).end('Invalid body') }
+  try {
+    buf = await getRawBody(req);
+  } catch {
+    return res.writeHead(400).end('Invalid body');
+  }
   if (!verifyShopifyWebhook(req, buf)) return res.writeHead(401).end('Unauthorized');
 
-  // parse payload
   let payload;
-  try { payload = JSON.parse(buf.toString()) } catch { return res.writeHead(400).end('Invalid JSON') }
+  try {
+    payload = JSON.parse(buf.toString());
+  } catch {
+    return res.writeHead(400).end('Invalid JSON');
+  }
 
-  // detect event
   const topicHeader = req.headers['x-shopify-topic'] || '';
   const topic = topicHeader.trim().toLowerCase();
-  console.log('Webhook topic:', topicHeader);
   const isCancel = topic === 'orders/cancelled';
   const hasRefund = Boolean(payload.refund_line_items || payload.refunds?.flatMap(r => r.refund_line_items || []).length);
   if (!isCancel && !hasRefund) return res.writeHead(200).end('Ignored');
 
-  // order + customer IDs
   const orderId = payload.order_id || payload.id;
   if (!orderId) return res.writeHead(400).end('Missing order ID');
 
-  // ensure customer GID
   let custGid = payload.customer?.id;
   if (!custGid) {
     try {
-      const r = await fetch(`https://${process.env.SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/${process.env.SHOPIFY_API_VERSION}/orders/${orderId}.json?fields=customer`, {
-        headers: {'X-Shopify-Access-Token': process.env.SHOPIFY_API_ACCESS_TOKEN}
-      });
+      const r = await fetch(
+        `https://${process.env.SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/${process.env.SHOPIFY_API_VERSION}/orders/${orderId}.json?fields=customer`,
+        { headers: { 'X-Shopify-Access-Token': process.env.SHOPIFY_API_ACCESS_TOKEN } }
+      );
       custGid = (await r.json()).order?.customer?.id;
-    } catch{};
+    } catch {}
   }
   if (!custGid) return res.writeHead(400).end('No customer ID');
   const custId = String(custGid).split('/').pop();
@@ -118,7 +139,6 @@ module.exports = async (req, res) => {
   const gqlUrl = `https://${process.env.SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/${process.env.SHOPIFY_API_VERSION}/graphql.json`;
   const shareUnit = Number(process.env.SHARE_UNIT);
 
-  // fetch prev metafields & current REST
   const multiQ = `
     query($oid:ID!,$cid:ID!){
       order: order(id:$oid){
@@ -129,11 +149,14 @@ module.exports = async (req, res) => {
     }`;
 
   const [prevRes, currRes] = await Promise.all([
-    fetch(gqlUrl, { method:'POST', headers:{'Content-Type':'application/json','X-Shopify-Access-Token':process.env.SHOPIFY_API_ACCESS_TOKEN},
-      body: JSON.stringify({ query: multiQ, variables:{ oid:`gid://shopify/Order/${orderId}`, cid:`gid://shopify/Customer/${custId}` } })
+    fetch(gqlUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': process.env.SHOPIFY_API_ACCESS_TOKEN },
+      body: JSON.stringify({ query: multiQ, variables: { oid: `gid://shopify/Order/${orderId}`, cid: `gid://shopify/Customer/${custId}` } })
     }),
-    fetch(`https://${process.env.SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/${process.env.SHOPIFY_API_VERSION}/orders/${orderId}.json?fields=current_subtotal_price,current_total_price,current_total_tax`,
-      { headers:{ 'X-Shopify-Access-Token': process.env.SHOPIFY_API_ACCESS_TOKEN } }
+    fetch(
+      `https://${process.env.SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/${process.env.SHOPIFY_API_VERSION}/orders/${orderId}.json?fields=current_subtotal_price,current_total_price,current_total_tax`,
+      { headers: { 'X-Shopify-Access-Token': process.env.SHOPIFY_API_ACCESS_TOKEN } }
     )
   ]);
 
@@ -147,33 +170,23 @@ module.exports = async (req, res) => {
   let currTot = parseFloat(currJson.order.current_total_price);
   let currTax = parseFloat(currJson.order.current_total_tax);
 
-  // cancel: zero out
   if (isCancel) {
     currSub = 0;
     currTot = 0;
     currTax = 0;
   }
 
-  // compute amount to adjust
   const adjust = prevSub - currSub;
   if (adjust <= 0) return res.writeHead(200).end('No change');
 
-  // new values
   const newSub = currSub;
   const newSharesOrder = Math.floor(newSub / shareUnit);
   const newRemOrder = newSub % shareUnit;
-
   const newRefunded = prevRefunded + adjust;
-
   const newSpent = prevSpent - adjust;
   const newSharesCust = Math.floor(newSpent / shareUnit);
   const newRemCust = newSpent % shareUnit;
 
-  console.log(`✏️ Order ${orderId} subtotal: ${prevSub.toFixed(2)} -> ${newSub.toFixed(2)}`);
-  console.log(`✏️ Order refunded amount: ${prevRefunded.toFixed(2)} -> ${newRefunded.toFixed(2)}`);
-  console.log(`✏️ Customer ${custId} spent: ${prevSpent.toFixed(2)} -> ${newSpent.toFixed(2)}`);
-
-  // mutation
   const mutation = `
     mutation($c:CustomerInput!,$o:OrderInput!){
       customerUpdate(input:$c){userErrors{field message}}
@@ -181,20 +194,20 @@ module.exports = async (req, res) => {
     }`;
 
   const vars = {
-    c: { id:`gid://shopify/Customer/${custId}`, metafields:[
-      {namespace:'loyalty',key:'net_spent_total',type:'number_decimal',value:newSpent.toFixed(2)},
-      {namespace:'loyalty',key:'reszvenyek_szama',type:'number_integer',value:newSharesCust.toString()},
-      {namespace:'custom',key:'jelenlegi_fennmarado',type:'number_decimal',value:newRemCust.toFixed(2)}
-    ]},
-    o: { id:`gid://shopify/Order/${orderId}`, metafields:[
-      {namespace:'custom',key:'subtotal',type:'number_decimal',value:newSub.toFixed(2)},
-      {namespace:'custom',key:'order_share',type:'number_integer',value:newSharesOrder.toString()},
-      {namespace:'custom',key:'order_remainder',type:'number_decimal',value:newRemOrder.toFixed(2)},
-      {namespace:'custom',key:'refunded_amount',type:'number_decimal',value:newRefunded.toFixed(2)}
-    ]}
+    c: { id: `gid://shopify/Customer/${custId}`, metafields: [
+      { namespace: 'loyalty', key: 'net_spent_total', type: 'number_decimal', value: newSpent.toFixed(2) },
+      { namespace: 'loyalty', key: 'reszvenyek_szama', type: 'number_integer', value: newSharesCust.toString() },
+      { namespace: 'custom', key: 'jelenlegi_fennmarado', type: 'number_decimal', value: newRemCust.toFixed(2) }
+    ] },
+    o: { id: `gid://shopify/Order/${orderId}`, metafields: [
+      { namespace: 'custom', key: 'subtotal', type: 'number_decimal', value: newSub.toFixed(2) },
+      { namespace: 'custom', key: 'order_share', type: 'number_integer', value: newSharesOrder.toString() },
+      { namespace: 'custom', key: 'order_remainder', type: 'number_decimal', value: newRemOrder.toFixed(2) },
+      { namespace: 'custom', key: 'refunded_amount', type: 'number_decimal', value: newRefunded.toFixed(2) }
+    ] }
   };
 
-  const mr = await fetch(gqlUrl, { method:'POST', headers:{'Content-Type':'application/json','X-Shopify-Access-Token':process.env.SHOPIFY_API_ACCESS_TOKEN}, body:JSON.stringify({query:mutation,variables:vars}) });
+  const mr = await fetch(gqlUrl, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': process.env.SHOPIFY_API_ACCESS_TOKEN }, body: JSON.stringify({ query: mutation, variables: vars }) });
   const mj = await mr.json();
   const errs = [...mj.data.customerUpdate.userErrors, ...mj.data.orderUpdate.userErrors];
   if (errs.length) {
