@@ -26,7 +26,7 @@ function verifyShopifyWebhook(req, buf) {
 }
 
 // 2) Sheet frissítő függvény: megtalálja az orderId-t az A oszlopban, módosítja L–M mezőket, majd a végére “módosítva” sort tesz
-async function adjustSheet(orderId, newSubtotal, newShares) {
+async function adjustSheet(orderId, newSubtotalPrice, newTotalPrice) {
   const auth = new google.auth.GoogleAuth({
     credentials: {
       client_email: process.env.GOOGLE_CLIENT_EMAIL,
@@ -39,12 +39,11 @@ async function adjustSheet(orderId, newSubtotal, newShares) {
   const ssId  = process.env.SPREADSHEET_ID;
   const sheet = process.env.SHEET_NAME;
 
-  // 1) Megkeressük az orderId-t az A oszlopban
-  const readA = await sheets.spreadsheets.values.get({
+  // 1) Megkeressük, melyik sorban van az orderId az A oszlopban
+  const { values: rowsA = [] } = (await sheets.spreadsheets.values.get({
     spreadsheetId: ssId,
     range: `${sheet}!A:A`
-  });
-  const rowsA = readA.data.values || [];
+  })).data;
   const rowIndex = rowsA.findIndex(r => r[0] === String(orderId));
   if (rowIndex === -1) {
     console.warn(`⚠️ Order ID ${orderId} nem található a sheetben`);
@@ -52,32 +51,33 @@ async function adjustSheet(orderId, newSubtotal, newShares) {
   }
   const targetRow = rowIndex + 1;
 
-  // 2) Frissítjük L (12.) és M (13.) oszlopot (A=1 → L=12, M=13)
+  // 2) Frissítjük az L (12.) és M (13.) oszlopot: subtotal_price és total_price
   await sheets.spreadsheets.values.update({
     spreadsheetId: ssId,
     range: `${sheet}!L${targetRow}:M${targetRow}`,
     valueInputOption: 'RAW',
-    resource: { values: [[ newSubtotal.toFixed(2), String(newShares) ]] }
+    resource: {
+      values: [[
+        newSubtotalPrice.toFixed(2),
+        newTotalPrice.toFixed(2)
+      ]]
+    }
   });
 
-  // 3) Q (17.) oszlopba írjuk a módosítás időpontját
-  // – először kiolvassuk a korábbi értéket
-  const readQ = await sheets.spreadsheets.values.get({
+  // 3) Frissítjük ugyanabban a sorban a Q (17.) oszlopot: "módosítva: ..." hozzáfűzéssel
+  const { values: prevQ = [] } = (await sheets.spreadsheets.values.get({
     spreadsheetId: ssId,
     range: `${sheet}!Q${targetRow}`
-  });
-  const prev = readQ.data.values?.[0]?.[0] || '';
+  })).data;
+  const prevNote = prevQ[0]?.[0] || '';
 
-  // – magyar idő formázása
-  const now = new Date();
-  now.setHours(now.getHours() + 2);
-  const pad = n => String(n).padStart(2, '0');
-  const ts = `${now.getFullYear()}.${pad(now.getMonth()+1)}.${pad(now.getDate())}` +
-             ` ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+  const now = new Date(); now.setHours(now.getHours() + 2);
+  const pad = n => String(n).padStart(2,'0');
+  const ts = `${now.getFullYear()}.${pad(now.getMonth()+1)}.${pad(now.getDate())}`
+           + ` ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
   const note = `módosítva: ${ts}`;
-  const updatedQ = prev ? `${prev}; ${note}` : note;
+  const updatedQ = prevNote ? `${prevNote}; ${note}` : note;
 
-  // – visszaírjuk ugyanoda Q oszlopba
   await sheets.spreadsheets.values.update({
     spreadsheetId: ssId,
     range: `${sheet}!Q${targetRow}`,
@@ -85,8 +85,9 @@ async function adjustSheet(orderId, newSubtotal, newShares) {
     resource: { values: [[ updatedQ ]] }
   });
 
-  console.log(`✅ Sor ${targetRow} frissítve: L,M és Q („${note}”)`);
+  console.log(`✅ Sor ${targetRow} frissítve: subtotal_price=${newSubtotalPrice}, total_price=${newTotalPrice}, Q="${note}"`);
 }
+
 
 module.exports = async (req, res) => {
   console.log('▶️  /order-adjust endpoint hit');
@@ -245,9 +246,11 @@ module.exports = async (req, res) => {
   }
 
   console.log('✅ Metafields updated');
+const originalTotalPrice = parseFloat(payload.total_price);
+const newTotalPrice      = originalTotalPrice - adjustAmount;
 
-  // 11) Sheet módosítása
-  await adjustSheet(orderId, newOrderSubtotal, newOrderShares);
+await adjustSheet(orderId, newOrderSubtotal, newTotalPrice);
+
 
   console.log('✅ Sheet adjusted');
   res.writeHead(200).end('OK');
