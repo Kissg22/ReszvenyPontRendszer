@@ -105,7 +105,7 @@ module.exports = async (req, res) => {
   const topicHeader = req.headers['x-shopify-topic'] || '';
   const topic = topicHeader.trim().toLowerCase();
   console.log('Webhook topic:', topicHeader);
-  console.log('Normalized topic:', topic);
+  
   const isCancel = topic === 'orders/cancelled';
   const hasRefund = Boolean(
     payload.refund_line_items || payload.refunds?.flatMap((r) => r.refund_line_items || []).length
@@ -168,7 +168,19 @@ module.exports = async (req, res) => {
   let currTot = parseFloat(currJson.order.current_total_price);
   let currTax = parseFloat(currJson.order.current_total_tax);
 
-  // --- cancel without refund: zero out values ---
+  // --- cancel event: zero out remaining values ---
+  if (isCancel) {
+    // if partial refund happened before, override prevSub to original order total
+    if (hasRefund && payload.total_price) {
+      const orig = parseFloat(payload.total_price);
+      console.log(`ℹ️ Partial refund then cancel: overriding prevSub to original total ${orig}`);
+      prevSub = orig;
+    }
+    console.log('ℹ️ Cancellation: zeroing order values');
+    currSub = 0;
+    currTot = 0;
+    currTax = 0;
+  }
   if (isCancel && !hasRefund) {
     console.log('ℹ️ Cancellation without refund: zeroing order values');
     currSub = 0;
@@ -190,6 +202,11 @@ module.exports = async (req, res) => {
   const newSpent = prevSpent - adjust;
   const newSharesCust = Math.floor(newSpent / shareUnit);
   const newRemCust = newSpent % shareUnit;
+
+  // log the update details
+  console.log(`✏️ Order ${orderId} subtotal changed: ${prevSub.toFixed(2)} -> ${newSub.toFixed(2)}`);
+  console.log(`✏️ Customer ${custId} spent changed: ${prevSpent.toFixed(2)} -> ${newSpent.toFixed(2)}`);
+
 
   // GraphQL mutation
   const mutation = `
