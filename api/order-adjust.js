@@ -39,43 +39,59 @@ async function adjustSheet(orderId, newSubtotal, newShares) {
   const ssId  = process.env.SPREADSHEET_ID;
   const sheet = process.env.SHEET_NAME;
 
-  // 2.1) Kiolvassuk az A oszlopot, hogy megtaláljuk a megfelelő sort
-  const read = await sheets.spreadsheets.values.get({
-    spreadsheetId: ssId,
-    range: `${sheet}!A:A`
-  });
-  const rows = read.data.values || [];
-  const rowIndex = rows.findIndex(r => r[0] === String(orderId));
-  if (rowIndex === -1) {
-    console.warn(`⚠️ Order ID ${orderId} nem található a sheetben`);
-  } else {
-    const targetRow = rowIndex + 1; // 1-gyel több, mert 1-es alapú sorindex a Sheets API-ban
-    // 2.2) L mező = új subtotal (13. oszlop), M mező = új shares (14. oszlop)
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: ssId,
-      range: `${sheet}!L${targetRow}:M${targetRow}`,
-      valueInputOption: 'RAW',
-      resource: { values: [[ newSubtotal.toFixed(2), String(newShares) ]] }
-    });
-    console.log(`✅ Sheet sor ${targetRow} frissítve: subtotal=${newSubtotal}, shares=${newShares}`);
-  }
+  // 2.1) Megkeressük a cél­sor számát az A-oszlopban
+const readA = await sheets.spreadsheets.values.get({
+  spreadsheetId: ssId,
+  range: `${sheet}!A:A`
+});
+const rowsA = readA.data.values || [];
+const rowIndex = rowsA.findIndex(r => r[0] === String(orderId));
+if (rowIndex === -1) {
+  console.warn(`⚠️ Order ID ${orderId} nem található a sheetben`);
+} else {
+  const targetRow = rowIndex + 1; // Sheets API 1-es alapú sorindex
 
-  // 2.3) A végére egy “módosítva” sor
-  const timestamp = new Date().toISOString();
-  await sheets.spreadsheets.values.append({
+  // 2.2) Frissítjük L (13.) és M (14.) oszlopot
+  await sheets.spreadsheets.values.update({
     spreadsheetId: ssId,
-    range: `${sheet}!A:Q`,    // A–Q téren belül pakoljuk az új sort
+    range: `${sheet}!L${targetRow}:M${targetRow}`,
     valueInputOption: 'RAW',
-    insertDataOption: 'INSERT_ROWS',
     resource: {
-      values: [[
-        '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
-        `módosítva: ${timestamp}`
-      ]]
+      values: [
+        [ newSubtotal.toFixed(2), String(newShares) ]
+      ]
     }
   });
-  console.log('✅ Végső „módosítva” sor beszúrva');
+
+  // 2.3) Frissítjük ugyan-ebben a sorban a Q (17.) oszlopot
+  //  - kiolvassuk a korábbi bejegyzést
+  const readQ = await sheets.spreadsheets.values.get({
+    spreadsheetId: ssId,
+    range: `${sheet}!Q${targetRow}`
+  });
+  const prev = readQ.data.values?.[0]?.[0] || '';
+  //  - magyar formátumú időbélyeg
+  const now = new Date();
+  now.setHours(now.getHours() + 2);
+  const pad = n => String(n).padStart(2, '0');
+  const ts = `${now.getFullYear()}.${pad(now.getMonth()+1)}.${pad(now.getDate())}` +
+             ` ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+  const note = `módosítva: ${ts}`;
+  const updatedQ = prev ? `${prev}; ${note}` : note;
+
+  //  - és visszaírjuk
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: ssId,
+    range: `${sheet}!Q${targetRow}`,
+    valueInputOption: 'RAW',
+    resource: {
+      values: [[ updatedQ ]]
+    }
+  });
+
+  console.log(`✅ Sor ${targetRow} frissítve: L,M és Q (módosítva: ${ts})`);
 }
+
 
 module.exports = async (req, res) => {
   console.log('▶️  /order-adjust endpoint hit');
