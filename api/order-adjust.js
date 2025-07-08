@@ -6,6 +6,11 @@ const { google } = require('googleapis');
 const fetch = global.fetch;
 if (!fetch) console.warn('⚠️ global fetch not available');
 
+// helper for decimal formatting: use comma as decimal separator
+function formatDecimal(num) {
+  return num.toFixed(2).replace('.', ',');
+}
+
 // Read raw body for HMAC
 async function getRawBody(req) {
   const chunks = [];
@@ -42,12 +47,16 @@ async function adjustSheet(orderId, subtotal, total, tax) {
   if (idx < 0) return console.warn(`Order ${orderId} not in sheet`);
   const rowNum = idx + 1;
 
-  // update L,M,N
+  // update L,M,N with comma-formatted decimals
   await sheets.spreadsheets.values.update({
     spreadsheetId: ssId,
     range: `${sheet}!L${rowNum}:N${rowNum}`,
     valueInputOption: 'RAW',
-    resource: { values: [[subtotal.toFixed(2), total.toFixed(2), tax.toFixed(2)]] },
+    resource: { values: [[
+      formatDecimal(subtotal),
+      formatDecimal(total),
+      formatDecimal(tax)
+    ]] },
   });
 
   // fetch full row to find first empty cell
@@ -195,15 +204,15 @@ module.exports = async (req, res) => {
 
   const vars = {
     c: { id: `gid://shopify/Customer/${custId}`, metafields: [
-      { namespace: 'loyalty', key: 'net_spent_total', type: 'number_decimal', value: newSpent.toFixed(2) },
+      { namespace: 'loyalty', key: 'net_spent_total', type: 'number_decimal', value: formatDecimal(newSpent) },
       { namespace: 'loyalty', key: 'reszvenyek_szama', type: 'number_integer', value: newSharesCust.toString() },
-      { namespace: 'custom', key: 'jelenlegi_fennmarado', type: 'number_decimal', value: newRemCust.toFixed(2) }
+      { namespace: 'custom', key: 'jelenlegi_fennmarado', type: 'number_decimal', value: formatDecimal(newRemCust) }
     ] },
     o: { id: `gid://shopify/Order/${orderId}`, metafields: [
-      { namespace: 'custom', key: 'subtotal', type: 'number_decimal', value: newSub.toFixed(2) },
+      { namespace: 'custom', key: 'subtotal', type: 'number_decimal', value: formatDecimal(newSub) },
       { namespace: 'custom', key: 'order_share', type: 'number_integer', value: newSharesOrder.toString() },
-      { namespace: 'custom', key: 'order_remainder', type: 'number_decimal', value: newRemOrder.toFixed(2) },
-      { namespace: 'custom', key: 'refunded_amount', type: 'number_decimal', value: newRefunded.toFixed(2) }
+      { namespace: 'custom', key: 'order_remainder', type: 'number_decimal', value: formatDecimal(newRemOrder) },
+      { namespace: 'custom', key: 'refunded_amount', type: 'number_decimal', value: formatDecimal(newRefunded) }
     ] }
   };
 

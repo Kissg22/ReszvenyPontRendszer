@@ -1,4 +1,3 @@
-// api/order-creation.js
 require('dotenv').config();
 const express = require('express');
 const crypto  = require('crypto');
@@ -49,12 +48,17 @@ async function appendOrderToSheet(order) {
 
   const items   = order.line_items || [];
   const qty     = items.reduce((s,i)=> s + (i.quantity||0),0);
-  const names   = items.map(i=>i.title).join(',');
-  const skus    = items.map(i=>i.sku).join(',');
-  const vendors = items.map(i=>i.vendor).join(',');
+  const names   = items.map(i=>i.title).join(';');
+  const skus    = items.map(i=>i.sku).join(';');
+  const vendors = items.map(i=>i.vendor).join(';');
 
   const addr = [ship.zip, ship.city, ship.address1, ship.address2]
-               .filter(Boolean).join(', ');
+               .filter(Boolean).join('; ');
+
+  // Replace decimal point with comma for Hungarian format
+  const subtotalHu = order.subtotal_price.replace('.', ',');
+  const totalHu    = order.total_price.replace('.', ',');
+  const taxHu      = order.total_tax.replace('.', ',');
 
   const row = [
     order.id,
@@ -68,21 +72,19 @@ async function appendOrderToSheet(order) {
     names,
     skus,
     vendors,
-    order.subtotal_price,
-    order.total_price,
-    order.total_tax,
+    subtotalHu,
+    totalHu,
+    taxHu,
     addr
   ];
 
-await sheets.spreadsheets.values.append({
-  spreadsheetId: process.env.SPREADSHEET_ID,
-  range: `${process.env.SHEET_NAME}!A1`,
-  valueInputOption: 'RAW',
-  insertDataOption: 'INSERT_ROWS',
-  resource: { values: [ row ] }
-});
-
-
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: process.env.SPREADSHEET_ID,
+    range: `${process.env.SHEET_NAME}!A1`,
+    valueInputOption: 'RAW',
+    insertDataOption: 'INSERT_ROWS',
+    resource: { values: [ row ] }
+  });
 }
 
 app.post('/webhook/order-creation', async (req, res) => {
