@@ -80,8 +80,8 @@ async function appendOrderToSheet(order) {
 
   await sheets.spreadsheets.values.append({
     spreadsheetId: process.env.SPREADSHEET_ID,
-    range: `${process.env.SHEET_NAME}!A1`,
-    valueInputOption: 'RAW',
+    range: `${process.env.SHEET_NAME}!A:T`, 
+    valueInputOption: 'USER_ENTERED',     
     insertDataOption: 'INSERT_ROWS',
     resource: { values: [ row ] }
   });
