@@ -51,7 +51,7 @@ async function adjustSheet(orderId, subtotal, total, tax) {
   await sheets.spreadsheets.values.update({
     spreadsheetId: ssId,
     range: `${sheet}!L${rowNum}:N${rowNum}`,
-    valueInputOption: 'RAW',
+    valueInputOption: 'USER_ENTERED',
     resource: { values: [[
       formatDecimal(subtotal),
       formatDecimal(total),
