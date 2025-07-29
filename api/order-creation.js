@@ -8,17 +8,33 @@ const fetch = global.fetch;
 if (!fetch) console.warn('⚠️ global fetch not available');
 
 const app = express();
-app.use(express.raw({ type: 'application/json' }));
 
-// HMAC validation
+// HMAC validation with detailed logs
 function verifyShopifyWebhook(req) {
-  const secret = process.env.SHOPIFY_API_SECRET_KEY;
+  const secret = process.env.SHOPIFY_API_SECRET_KEY?.trim();
+  console.log('🔐 Secret loaded:', Boolean(secret));
   if (!secret) throw new Error('Missing SHOPIFY_API_SECRET_KEY');
-  const hmacHeader = req.headers['x-shopify-hmac-sha256'];
-  const digest = crypto.createHmac('sha256', secret)
-                      .update(req.body)
-                      .digest('base64');
-  return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader));
+
+  const hmacHeader = req.get('X-Shopify-Hmac-Sha256');
+  console.log('📥 Shopify HMAC header:', hmacHeader);
+
+  // log first 200 bytes of raw body
+  const snippet = req.body.slice(0, 200).toString('utf8');
+  console.log('📦 Raw body (first 200 bytes):', snippet);
+
+  const digest = crypto
+    .createHmac('sha256', secret)
+    .update(req.body)
+    .digest('base64');
+  console.log('🔨 Computed digest:', digest);
+
+  const valid = crypto.timingSafeEqual(
+    Buffer.from(digest),
+    Buffer.from(hmacHeader || '')
+  );
+  console.log('✅ HMAC valid?', valid);
+
+  return valid;
 }
 
 // Format date to Hungarian UTC+2
@@ -87,93 +103,112 @@ async function appendOrderToSheet(order) {
   });
 }
 
-app.post('/webhook/order-creation', async (req, res) => {
-  if (req.method !== 'POST') return res.status(405).end('Method Not Allowed');
-  if (!verifyShopifyWebhook(req)) return res.status(401).end('Unauthorized');
+app.post(
+  '/webhook/order-creation',
+  // ensure raw body for any content-type
+  express.raw({ type: '*/*', limit: '1mb' }),
+  async (req, res) => {
+    console.log('▶️ order-creation handler called, method:', req.method);
 
-  const order = JSON.parse(req.body.toString('utf8'));
-  console.log(`▶️ Order ${order.id} received`);
-
-  // --- Metafield update ---
-  const shop      = process.env.SHOPIFY_SHOP_NAME;
-  const token     = process.env.SHOPIFY_API_ACCESS_TOKEN;
-  const shareUnit = Number(process.env.SHARE_UNIT);
-  const endpoint  = `https://${shop}.myshopify.com/admin/api/${process.env.SHOPIFY_API_VERSION}/graphql.json`;
-
-  const custGid = String(order.customer.id).split('/').pop();
-  console.log(`🆔 Customer GID: ${custGid}`);
-
-  // 1) Read existing metafields
-  const readRes = await fetch(endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type':'application/json','X-Shopify-Access-Token':token },
-    body: JSON.stringify({
-      query: `query getCustomer($id: ID!) { customer(id: $id) {
-        netSpent: metafield(namespace: "loyalty", key: "net_spent_total") { value }
-        sharesCount: metafield(namespace: "loyalty", key: "reszvenyek_szama") { value }
-        remainder: metafield(namespace: "custom", key: "jelenlegi_fennmarado") { value }
-      }}`,
-      variables: { id: `gid://shopify/Customer/${custGid}` }
-    })
-  });
-  const { data, errors } = await readRes.json();
-  if (errors?.length) throw errors;
-  const prevSpent     = parseFloat(data.customer.netSpent?.value || '0');
-  const prevShares    = parseInt(data.customer.sharesCount?.value || '0',10);
-  const prevRemainder = parseFloat(data.customer.remainder?.value || '0');
-  console.log(`PrevSpent:${prevSpent} Shares:${prevShares}`);
-
-  // 2) Compute new values
-  const subtotal     = parseFloat(order.subtotal_price);
-  const newTotal     = prevSpent + subtotal;
-  const totalShares  = Math.floor(newTotal / shareUnit);
-  const earnedShares = totalShares - prevShares;
-  const newRemainder = newTotal % shareUnit;
-  console.log(`Earned:${earnedShares}`);
-
-  // 3) Mutate
-  const mutation = `mutation updateBoth($custInput: CustomerInput!, $orderInput: OrderInput!) {
-    customerUpdate(input: $custInput) { userErrors { field message } }
-    orderUpdate(input: $orderInput) { userErrors { field message } }
-  }`;
-  const variables = {
-    custInput: {
-      id: `gid://shopify/Customer/${custGid}`,
-      metafields: [
-        { namespace:'loyalty', key:'net_spent_total', type:'number_decimal', value:newTotal.toFixed(2) },
-        { namespace:'loyalty', key:'reszvenyek_szama', type:'number_integer', value:totalShares.toString() },
-        { namespace:'custom',  key:'jelenlegi_fennmarado', type:'number_decimal', value:newRemainder.toFixed(2) }
-      ]
-    },
-    orderInput: {
-      id: `gid://shopify/Order/${order.id}`,
-      metafields: [
-        { namespace:'custom', key:'subtotal', type:'number_decimal', value:subtotal.toFixed(2) },
-        { namespace:'custom', key:'order_share', type:'number_integer', value:earnedShares.toString() },
-        { namespace:'custom', key:'order_remainder', type:'number_decimal', value:newRemainder.toFixed(2) }
-      ]
+    if (req.method !== 'POST') {
+      console.log('⚠️ Nem POST kérés érkezett');
+      return res.status(405).end('Method Not Allowed');
     }
-  };
-  const mutRes = await fetch(endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type':'application/json','X-Shopify-Access-Token':token },
-    body: JSON.stringify({ query: mutation, variables })
-  });
-  const mutJson = await mutRes.json();
-  const custErrs = mutJson.data.customerUpdate.userErrors;
-  const orderErrs = mutJson.data.orderUpdate.userErrors;
-  if (custErrs.length || orderErrs.length) {
-    console.error('Mutation errors',custErrs,orderErrs);
-    return res.status(500).end('Metafield update failed');
+
+    try {
+      if (!verifyShopifyWebhook(req)) {
+        console.log('❌ HMAC validation failed');
+        return res.status(401).end('Unauthorized');
+      }
+
+      const order = JSON.parse(req.body.toString('utf8'));
+      console.log(`▶️ Order ${order.id} received`);
+
+      // --- Metafield update ---
+      const shop      = process.env.SHOPIFY_SHOP_NAME;
+      const token     = process.env.SHOPIFY_API_ACCESS_TOKEN;
+      const shareUnit = Number(process.env.SHARE_UNIT);
+      const endpoint  = `https://${shop}.myshopify.com/admin/api/${process.env.SHOPIFY_API_VERSION}/graphql.json`;
+
+      const custGid = String(order.customer.id).split('/').pop();
+      console.log(`🆔 Customer GID: ${custGid}`);
+
+      // 1) Read existing metafields
+      const readRes = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type':'application/json','X-Shopify-Access-Token':token },
+        body: JSON.stringify({
+          query: `query getCustomer($id: ID!) { customer(id: $id) {
+            netSpent: metafield(namespace: "loyalty", key: "net_spent_total") { value }
+            sharesCount: metafield(namespace: "loyalty", key: "reszvenyek_szama") { value }
+            remainder: metafield(namespace: "custom", key: "jelenlegi_fennmarado") { value }
+          }}`,
+          variables: { id: `gid://shopify/Customer/${custGid}` }
+        })
+      });
+      const { data, errors } = await readRes.json();
+      if (errors?.length) throw errors;
+      const prevSpent     = parseFloat(data.customer.netSpent?.value || '0');
+      const prevShares    = parseInt(data.customer.sharesCount?.value || '0',10);
+      const prevRemainder = parseFloat(data.customer.remainder?.value || '0');
+      console.log(`PrevSpent:${prevSpent} Shares:${prevShares}`);
+
+      // 2) Compute new values
+      const subtotal     = parseFloat(order.subtotal_price);
+      const newTotal     = prevSpent + subtotal;
+      const totalShares  = Math.floor(newTotal / shareUnit);
+      const earnedShares = totalShares - prevShares;
+      const newRemainder = newTotal % shareUnit;
+      console.log(`Earned:${earnedShares} NewRemainder:${newRemainder}`);
+
+      // 3) Mutate
+      const mutation = `mutation updateBoth($custInput: CustomerInput!, $orderInput: OrderInput!) {
+        customerUpdate(input: $custInput) { userErrors { field message } }
+        orderUpdate(input: $orderInput) { userErrors { field message } }
+      }`;
+      const variables = {
+        custInput: {
+          id: `gid://shopify/Customer/${custGid}`,
+          metafields: [
+            { namespace:'loyalty', key:'net_spent_total', type:'number_decimal', value:newTotal.toFixed(2) },
+            { namespace:'loyalty', key:'reszvenyek_szama', type:'number_integer', value:totalShares.toString() },
+            { namespace:'custom',  key:'jelenlegi_fennmarado', type:'number_decimal', value:newRemainder.toFixed(2) }
+          ]
+        },
+        orderInput: {
+          id: `gid://shopify/Order/${order.id}`,
+          metafields: [
+            { namespace:'custom', key:'subtotal', type:'number_decimal', value:subtotal.toFixed(2) },
+            { namespace:'custom', key:'order_share', type:'number_integer', value:earnedShares.toString() },
+            { namespace:'custom', key:'order_remainder', type:'number_decimal', value:newRemainder.toFixed(2) }
+          ]
+        }
+      };
+      const mutRes = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type':'application/json','X-Shopify-Access-Token':token },
+        body: JSON.stringify({ query: mutation, variables })
+      });
+      const mutJson = await mutRes.json();
+      const custErrs  = mutJson.data.customerUpdate.userErrors;
+      const orderErrs = mutJson.data.orderUpdate.userErrors;
+      if (custErrs.length || orderErrs.length) {
+        console.error('Mutation errors', custErrs, orderErrs);
+        return res.status(500).end('Metafield update failed');
+      }
+      console.log('✅ Metafields updated');
+
+      // 4) Sheet write
+      await appendOrderToSheet(order);
+      console.log('✅ Sheet updated');
+
+      res.status(200).end('OK');
+    } catch (err) {
+      console.error('🔥 Unexpected error in webhook handler:', err);
+      res.status(500).end('Internal Server Error');
+    }
   }
-  console.log('✅ Metafields updated');
+);
 
-  // 4) Sheet write
-  await appendOrderToSheet(order);
-  console.log('✅ Sheet updated');
-
-  res.writeHead(200).end('OK');
-});
-
-const PORT = process.env.PORT||3000;
-app.listen(PORT,()=>console.log(`🚀 Listening on ${PORT}`));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`🚀 Listening on ${PORT}`));
