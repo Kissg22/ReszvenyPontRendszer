@@ -1,13 +1,13 @@
 'use strict';
 
 /**
- * Vercel/Next API kompatibilis utilok:
- * - getRawBody(req) nyers body-hoz (HMAC)
- * - verifyHmac, requireShopAndTopic
- * - Google Sheets singleton kliens
+ * Vercel/Next API utilok:
+ * - getRawBody(req) nyers body (HMAC-hez)
+ * - verifyHmac, requireShopAndTopic (több topic támogatás)
+ * - Google Sheets singleton (GoogleAuth + JWT fallback)
  * - Shopify GraphQL kliens (API ver. normalizálás)
  * - HU dátum/decimális formázók
- * - withRetry, requireEnv, sheetRange
+ * - withRetry, requireEnv, sheetRange, sendJson
  */
 
 const crypto = require('crypto');
@@ -22,25 +22,19 @@ function requireEnv(keys) {
 }
 requireEnv(['SHOPIFY_API_SECRET_KEY', 'GOOGLE_CLIENT_EMAIL', 'GOOGLE_PRIVATE_KEY']);
 
-// ---- Nyers body olvasása (Vercel/Next API) ----
+// ---- Nyers body olvasás ----
 async function getRawBody(req) {
-  // Ha már buffer
   if (req.body && Buffer.isBuffer(req.body)) return req.body;
-
-  // Next API bodyParser kikapcsolása esetén jellemzően streamet kapunk:
   const chunks = [];
-  for await (const chunk of req) {
-    chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
-  }
+  for await (const chunk of req) chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
   return Buffer.concat(chunks);
 }
 
-// ---- HMAC ellenőrzés Shopify-hoz ----
+// ---- HMAC ellenőrzés ----
 function verifyHmac(req, rawBody) {
   const secret = (process.env.SHOPIFY_API_SECRET_KEY || '').trim();
   const received = (req.headers['x-shopify-hmac-sha256'] || '').toString();
   if (!received || !secret) return false;
-
   const digest = crypto.createHmac('sha256', secret).update(rawBody).digest('base64');
   const a = Buffer.from(digest, 'base64');
   const b = Buffer.from(received, 'base64');
@@ -48,8 +42,8 @@ function verifyHmac(req, rawBody) {
   return crypto.timingSafeEqual(a, b);
 }
 
-// ---- Shop & Topic guard (opcionális) ----
-function requireShopAndTopic(req, expectedTopic) {
+// ---- Shop & Topic guard (több topic támogatás) ----
+function requireShopAndTopic(req, expectedTopics) {
   const shopHeader = (req.headers['x-shopify-shop-domain'] || '').toString();
   const topicHeader = (req.headers['x-shopify-topic'] || '').toString();
   const expectedShop = (process.env.SHOPIFY_SHOP_NAME || '').trim();
@@ -59,10 +53,14 @@ function requireShopAndTopic(req, expectedTopic) {
     err.status = 400;
     throw err;
   }
-  if (expectedTopic && topicHeader && topicHeader !== expectedTopic) {
-    const err = new Error(`Nem várt webhook topic: ${topicHeader} (várt: ${expectedTopic})`);
-    err.status = 400;
-    throw err;
+
+  if (expectedTopics) {
+    const allow = Array.isArray(expectedTopics) ? expectedTopics : [expectedTopics];
+    if (topicHeader && !allow.includes(topicHeader)) {
+      const err = new Error(`Nem várt webhook topic: ${topicHeader} (várt: ${allow.join(' | ')})`);
+      err.status = 400;
+      throw err;
+    }
   }
 }
 
@@ -81,13 +79,34 @@ function normalizeGooglePrivateKey(raw) {
 let _sheets = null;
 async function getSheets() {
   if (_sheets) return _sheets;
-  const auth = new google.auth.JWT({
-    email: process.env.GOOGLE_CLIENT_EMAIL,
-    key: normalizeGooglePrivateKey(process.env.GOOGLE_PRIVATE_KEY || ''),
+
+  const credentials = {
+    client_email: process.env.GOOGLE_CLIENT_EMAIL,
+    private_key: normalizeGooglePrivateKey(process.env.GOOGLE_PRIVATE_KEY || ''),
+  };
+
+  // Elsődlegesen GoogleAuth (itt van getClient)
+  try {
+    const googleAuth = new google.auth.GoogleAuth({
+      credentials,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
+    const client = await googleAuth.getClient();
+    _sheets = google.sheets({ version: 'v4', auth: client });
+    return _sheets;
+  } catch (e) {
+    console.warn('[GoogleAuth] fallback JWT-re:', e?.message || e);
+  }
+
+  // Fallback: JWT közvetlenül (régebbi googleapis csomagoknál bevált)
+  const jwt = new google.auth.JWT({
+    email: credentials.client_email,
+    key: credentials.private_key,
     scopes: ['https://www.googleapis.com/auth/spreadsheets'],
   });
-  const client = await auth.getClient();
-  _sheets = google.sheets({ version: 'v4', auth: client });
+  // Régi mintában authorize-t hívunk, de a JWT maga is használható auth-ként:
+  await new Promise((res, rej) => jwt.authorize(err => (err ? rej(err) : res())));
+  _sheets = google.sheets({ version: 'v4', auth: jwt });
   return _sheets;
 }
 
@@ -164,7 +183,7 @@ function formatDecimal(x) {
   return nfHu2.format(safe);
 }
 
-// ---- Retry helper ----
+// ---- Retry & válaszküldés ----
 async function withRetry(fn, tries = 3) {
   let last;
   for (let i = 0; i < tries; i++) {
@@ -180,7 +199,6 @@ async function withRetry(fn, tries = 3) {
   throw last;
 }
 
-// ---- JSON válasz küldése (Vercel/micro kompatibilis) ----
 function sendJson(res, statusCode, obj) {
   res.statusCode = statusCode;
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
