@@ -1,7 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const crypto  = require('crypto');
-const { google } = require('googleapis');
+const { getSheets, formatHuDate, formatDecimal } = require('./utils');
 
 // Node 18+ global fetch
 const fetch = global.fetch;
@@ -9,14 +9,29 @@ if (!fetch) console.warn('⚠️ global fetch not available');
 
 const app = express();
 
-// HMAC validation with detailed logs
+// Track processed webhook deliveries to avoid duplicates.
+// Entries expire after one hour to prevent unbounded growth.
+const WEBHOOK_ID_TTL_MS = 60 * 60 * 1000; // 1 hour
+const processedWebhookIds = new Map(); // id -> timestamp
+
+function rememberWebhookId(id) {
+  const now = Date.now();
+  processedWebhookIds.set(id, now);
+  // Cleanup old entries
+  for (const [key, ts] of processedWebhookIds) {
+    if (now - ts > WEBHOOK_ID_TTL_MS) processedWebhookIds.delete(key);
+  }
+}
+
+// HMAC validation with graceful handling of missing/invalid headers
 function verifyShopifyWebhook(req) {
   const secret = process.env.SHOPIFY_API_SECRET_KEY?.trim();
   console.log('🔐 Secret loaded:', Boolean(secret));
-  if (!secret) throw new Error('Missing SHOPIFY_API_SECRET_KEY');
+  if (!secret) return false;
 
   const hmacHeader = req.get('X-Shopify-Hmac-Sha256');
   console.log('📥 Shopify HMAC header:', hmacHeader);
+  if (!hmacHeader) return false;
 
   // log first 200 bytes of raw body
   const snippet = req.body.slice(0, 200).toString('utf8');
@@ -25,38 +40,20 @@ function verifyShopifyWebhook(req) {
   const digest = crypto
     .createHmac('sha256', secret)
     .update(req.body)
-    .digest('base64');
-  console.log('🔨 Computed digest:', digest);
-
-  const valid = crypto.timingSafeEqual(
-    Buffer.from(digest),
-    Buffer.from(hmacHeader || '')
-  );
+    .digest();
+  const provided = Buffer.from(hmacHeader, 'base64');
+  if (digest.length !== provided.length) {
+    console.warn('⚠️ HMAC length mismatch');
+    return false;
+  }
+  const valid = crypto.timingSafeEqual(digest, provided);
   console.log('✅ HMAC valid?', valid);
-
   return valid;
-}
-
-// Format date to Hungarian UTC+2
-function formatHuDate(iso) {
-  const d = new Date(iso);
-  d.setHours(d.getHours() + 2);
-  const pad = n => String(n).padStart(2,'0');
-  return `${d.getFullYear()}.${pad(d.getMonth()+1)}.${pad(d.getDate())}` +
-         ` ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
 // Append to Google Sheets A:T
 async function appendOrderToSheet(order) {
-  const auth = new google.auth.GoogleAuth({
-    credentials: {
-      client_email: process.env.GOOGLE_CLIENT_EMAIL,
-      private_key:   process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g,'\n'),
-    },
-    scopes: ['https://www.googleapis.com/auth/spreadsheets']
-  });
-  const client = await auth.getClient();
-  const sheets = google.sheets({ version: 'v4', auth: client });
+  const sheets = await getSheets();
 
   const cust    = order.customer || {};
   const ship    = order.shipping_address || {};
@@ -71,11 +68,6 @@ async function appendOrderToSheet(order) {
   const addr = [ship.zip, ship.city, ship.address1, ship.address2]
                .filter(Boolean).join('; ');
 
-  // Replace decimal point with comma for Hungarian format
-  const subtotalHu = order.subtotal_price.replace('.', ',');
-  const totalHu    = order.total_price.replace('.', ',');
-  const taxHu      = order.total_tax.replace('.', ',');
-
   const row = [
     order.id,
     order.name,
@@ -88,9 +80,9 @@ async function appendOrderToSheet(order) {
     names,
     skus,
     vendors,
-    subtotalHu,
-    totalHu,
-    taxHu,
+    formatDecimal(order.subtotal_price),
+    formatDecimal(order.total_price),
+    formatDecimal(order.total_tax),
     addr
   ];
 
@@ -121,6 +113,16 @@ app.post(
         return res.status(401).end('Unauthorized');
       }
 
+      const webhookId = req.get('X-Shopify-Webhook-Id');
+      if (webhookId) {
+        const ts = processedWebhookIds.get(webhookId);
+        if (ts && Date.now() - ts < WEBHOOK_ID_TTL_MS) {
+          console.log(`🔁 Webhook ${webhookId} already processed`);
+          return res.status(200).end('Duplicate');
+        }
+        rememberWebhookId(webhookId);
+      }
+
       const order = JSON.parse(req.body.toString('utf8'));
       console.log(`▶️ Order ${order.id} received`);
 
@@ -133,21 +135,37 @@ app.post(
       const custGid = String(order.customer.id).split('/').pop();
       console.log(`🆔 Customer GID: ${custGid}`);
 
-      // 1) Read existing metafields
+      // 1) Read existing metafields and check for duplicates
       const readRes = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type':'application/json','X-Shopify-Access-Token':token },
         body: JSON.stringify({
-          query: `query getCustomer($id: ID!) { customer(id: $id) {
-            netSpent: metafield(namespace: "loyalty", key: "net_spent_total") { value }
-            sharesCount: metafield(namespace: "loyalty", key: "reszvenyek_szama") { value }
-            remainder: metafield(namespace: "custom", key: "jelenlegi_fennmarado") { value }
-          }}`,
-          variables: { id: `gid://shopify/Customer/${custGid}` }
+          query: `query getData($cid: ID!, $oid: ID!) {
+            customer(id: $cid) {
+              netSpent: metafield(namespace: "loyalty", key: "net_spent_total") { value }
+              sharesCount: metafield(namespace: "loyalty", key: "reszvenyek_szama") { value }
+              remainder: metafield(namespace: "custom", key: "jelenlegi_fennmarado") { value }
+            }
+            order(id: $oid) {
+              subtotalMeta: metafield(namespace: "custom", key: "subtotal") { value }
+            }
+          }`,
+          variables: {
+            cid: `gid://shopify/Customer/${custGid}`,
+            oid: `gid://shopify/Order/${order.id}`
+          }
         })
       });
+      if (!readRes.ok) {
+        console.error('❌ Shopify read error', readRes.status);
+        return res.status(500).end('Shopify read error');
+      }
       const { data, errors } = await readRes.json();
       if (errors?.length) throw errors;
+      if (data.order?.subtotalMeta?.value) {
+        console.log('⚠️ Order already processed, skipping duplicates');
+        return res.status(200).end('Already processed');
+      }
       const prevSpent     = parseFloat(data.customer.netSpent?.value || '0');
       const prevShares    = parseInt(data.customer.sharesCount?.value || '0',10);
       const prevRemainder = parseFloat(data.customer.remainder?.value || '0');
@@ -189,6 +207,10 @@ app.post(
         headers: { 'Content-Type':'application/json','X-Shopify-Access-Token':token },
         body: JSON.stringify({ query: mutation, variables })
       });
+      if (!mutRes.ok) {
+        console.error('❌ Shopify mutation error', mutRes.status);
+        return res.status(500).end('Shopify mutation error');
+      }
       const mutJson = await mutRes.json();
       const custErrs  = mutJson.data.customerUpdate.userErrors;
       const orderErrs = mutJson.data.orderUpdate.userErrors;
@@ -204,6 +226,8 @@ app.post(
 
       res.status(200).end('OK');
     } catch (err) {
+      const webhookId = req.get('X-Shopify-Webhook-Id');
+      if (webhookId) processedWebhookIds.delete(webhookId);
       console.error('🔥 Unexpected error in webhook handler:', err);
       res.status(500).end('Internal Server Error');
     }

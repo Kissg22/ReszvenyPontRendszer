@@ -1,15 +1,10 @@
 require('dotenv').config();
 const crypto = require('crypto');
-const { google } = require('googleapis');
+const { getSheets, formatHuDate, formatDecimal } = require('./utils');
 
 // Node18+ global fetch
 const fetch = global.fetch;
 if (!fetch) console.warn('⚠️ global fetch not available');
-
-// helper for decimal formatting for Sheets: comma as decimal separator
-function formatDecimal(num) {
-  return num.toFixed(2).replace('.', ',');
-}
 
 // Read raw body for HMAC
 async function getRawBody(req) {
@@ -29,14 +24,7 @@ function verifyShopifyWebhook(req, buf) {
 
 // 2) Update Google Sheet: L=subtotal, M=total, N=tax, then write "módosítva" note in first empty cell
 async function adjustSheet(orderId, subtotal, total, tax) {
-  const auth = new google.auth.GoogleAuth({
-    credentials: {
-      client_email: process.env.GOOGLE_CLIENT_EMAIL,
-      private_key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-    },
-    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-  });
-  const sheets = google.sheets({ version: 'v4', auth: await auth.getClient() });
+  const sheets = await getSheets();
   const ssId = process.env.SPREADSHEET_ID;
   const sheet = process.env.SHEET_NAME;
 
@@ -87,12 +75,7 @@ async function adjustSheet(orderId, subtotal, total, tax) {
   const col = colLetter(emptyIdx);
 
   // 2.4) Prepare and write the "módosítva" note with Hungarian UTC+2 timestamp
-  const now = new Date();
-  now.setHours(now.getHours() + 2);
-  const pad = n => String(n).padStart(2, '0');
-  const ts = `${now.getFullYear()}.${pad(now.getMonth()+1)}.${pad(now.getDate())}` +
-             ` ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
-  const note = `módosítva: ${ts}`;
+  const note = `módosítva: ${formatHuDate(new Date())}`;
 
   await sheets.spreadsheets.values.update({
     spreadsheetId: ssId,
@@ -157,7 +140,11 @@ module.exports = async (req, res) => {
         `/orders/${orderId}.json?fields=customer`,
         { headers: { 'X-Shopify-Access-Token': process.env.SHOPIFY_API_ACCESS_TOKEN } }
       );
-      custGid = (await r.json()).order?.customer?.id;
+      if (r.ok) {
+        custGid = (await r.json()).order?.customer?.id;
+      } else {
+        console.error('❌ Shopify customer lookup failed', r.status);
+      }
     } catch {}
   }
   if (!custGid) {
@@ -180,40 +167,55 @@ module.exports = async (req, res) => {
       customer: customer(id:$cid){spent: metafield(namespace:"loyalty",key:"net_spent_total"){value}}
     }`;
 
-  const [prevRes, currRes] = await Promise.all([
-    fetch(gqlUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': process.env.SHOPIFY_API_ACCESS_TOKEN
-      },
-      body: JSON.stringify({
-        query: multiQ,
-        variables: {
-          oid: `gid://shopify/Order/${orderId}`,
-          cid: `gid://shopify/Customer/${custId}`
-        }
-      })
-    }),
-    fetch(
-      `https://${process.env.SHOPIFY_SHOP_NAME}` +
-      `.myshopify.com/admin/api/${process.env.SHOPIFY_API_VERSION}` +
-      `/orders/${orderId}.json?fields=current_subtotal_price,current_total_price,current_total_tax`,
-      { headers: { 'X-Shopify-Access-Token': process.env.SHOPIFY_API_ACCESS_TOKEN } }
-    )
-  ]);
+    const [prevRes, currRes] = await Promise.all([
+      fetch(gqlUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Shopify-Access-Token': process.env.SHOPIFY_API_ACCESS_TOKEN
+        },
+        body: JSON.stringify({
+          query: multiQ,
+          variables: {
+            oid: `gid://shopify/Order/${orderId}`,
+            cid: `gid://shopify/Customer/${custId}`
+          }
+        })
+      }),
+      fetch(
+        `https://${process.env.SHOPIFY_SHOP_NAME}` +
+        `.myshopify.com/admin/api/${process.env.SHOPIFY_API_VERSION}` +
+        `/orders/${orderId}.json?fields=current_subtotal_price,current_total_price,current_total_tax`,
+        { headers: { 'X-Shopify-Access-Token': process.env.SHOPIFY_API_ACCESS_TOKEN } }
+      )
+    ]);
+    if (!prevRes.ok || !currRes.ok) {
+      console.error('❌ Shopify fetch error', prevRes.status, currRes.status);
+      return res.writeHead(500).end('Shopify fetch error');
+    }
 
   // Parse previous values
   const prevJson     = await prevRes.json();
-  let prevSub        = parseFloat(prevJson.data.order.subtotal?.value || 0);
-  let prevRefunded   = parseFloat(prevJson.data.order.refunded?.value || 0);
-  const prevSpent    = parseFloat(prevJson.data.customer.spent?.value || 0);
+  const prevOrder    = prevJson.data?.order;
+  const prevCustomer = prevJson.data?.customer;
+  if (!prevOrder || !prevCustomer) {
+    console.warn('⚠️ Missing previous order/customer data');
+    return res.writeHead(500).end('Shopify response missing data');
+  }
+  let prevSub        = parseFloat(prevOrder.subtotal?.value || '0');
+  let prevRefunded   = parseFloat(prevOrder.refunded?.value || '0');
+  const prevSpent    = parseFloat(prevCustomer.spent?.value || '0');
 
   // Parse current values
   const currJson     = await currRes.json();
-  let currSub        = parseFloat(currJson.order.current_subtotal_price);
-  let currTot        = parseFloat(currJson.order.current_total_price);
-  let currTax        = parseFloat(currJson.order.current_total_tax);
+  const currOrder    = currJson.order;
+  if (!currOrder) {
+    console.warn('⚠️ Missing current order data');
+    return res.writeHead(500).end('Shopify response missing data');
+  }
+  let currSub        = parseFloat(currOrder.current_subtotal_price || '0');
+  let currTot        = parseFloat(currOrder.current_total_price || '0');
+  let currTax        = parseFloat(currOrder.current_total_tax || '0');
 
   // If cancellation, zero everything
   if (isCancel) {
@@ -307,6 +309,10 @@ module.exports = async (req, res) => {
     },
     body: JSON.stringify({ query: mutation, variables: vars })
   });
+  if (!mr.ok) {
+    console.error('❌ Shopify mutation error', mr.status);
+    return res.writeHead(500).end('Shopify mutation error');
+  }
   const mj = await mr.json();
   const errs = [
     ...mj.data.customerUpdate.userErrors,
