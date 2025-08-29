@@ -1,189 +1,214 @@
-'use strict';
-
-/**
- * Vercel szerverless handler (orders/create | orders/paid):
- * - Nyers body + HMAC
- * - Shop/topic guard (több topic támogatás)
- * - Idempotens sor hozzáfűzés Google Sheets-hez
- * - (Opcionális) Shopify metafield frissítés
- */
-
 require('dotenv').config();
+const express = require('express');
+const crypto  = require('crypto');
+const { google } = require('googleapis');
 
-const {
-  getRawBody,
-  verifyHmac,
-  requireShopAndTopic,
-  sendJson,
-  getSheets,
-  sheetRange,
-  formatHuDate,
-  formatDecimal,
-  shopifyGQL,
-  withRetry,
-  requireEnv,
-} = require('./utils');
+// Node 18+ global fetch
+const fetch = global.fetch;
+if (!fetch) console.warn('⚠️ global fetch not available');
 
-requireEnv(['SPREADSHEET_ID', 'SHEET_NAME']);
+const app = express();
 
-// Next.js API alatt nyers body kell a HMAC-hez
-module.exports.config = { api: { bodyParser: false } };
+// HMAC validation with detailed logs
+function verifyShopifyWebhook(req) {
+  const secret = process.env.SHOPIFY_API_SECRET_KEY?.trim();
+  console.log('🔐 Secret loaded:', Boolean(secret));
+  if (!secret) throw new Error('Missing SHOPIFY_API_SECRET_KEY');
 
-// --- Segédfüggvények ---
-function safeLen(arr) {
-  return Array.isArray(arr) ? arr.length : 0;
+  const hmacHeader = req.get('X-Shopify-Hmac-Sha256');
+  console.log('📥 Shopify HMAC header:', hmacHeader);
+
+  // log first 200 bytes of raw body
+  const snippet = req.body.slice(0, 200).toString('utf8');
+  console.log('📦 Raw body (first 200 bytes):', snippet);
+
+  const digest = crypto
+    .createHmac('sha256', secret)
+    .update(req.body)
+    .digest('base64');
+  console.log('🔨 Computed digest:', digest);
+
+  const valid = crypto.timingSafeEqual(
+    Buffer.from(digest),
+    Buffer.from(hmacHeader || '')
+  );
+  console.log('✅ HMAC valid?', valid);
+
+  return valid;
 }
 
-function buildRowFromOrder(order) {
-  const cust = order?.customer || {};
-  const ship = order?.shipping_address || {};
-  const payGateways = Array.isArray(order?.payment_gateway_names)
-    ? order.payment_gateway_names.join(', ')
-    : (order?.payment_gateway_names || '');
+// Format date to Hungarian UTC+2
+function formatHuDate(iso) {
+  const d = new Date(iso);
+  d.setHours(d.getHours() + 2);
+  const pad = n => String(n).padStart(2,'0');
+  return `${d.getFullYear()}.${pad(d.getMonth()+1)}.${pad(d.getDate())}` +
+         ` ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
 
-  const discountCodes = Array.isArray(order?.discount_codes)
-    ? order.discount_codes.map(d => d?.code).filter(Boolean).join(', ')
-    : '';
+// Append to Google Sheets A:T
+async function appendOrderToSheet(order) {
+  const auth = new google.auth.GoogleAuth({
+    credentials: {
+      client_email: process.env.GOOGLE_CLIENT_EMAIL,
+      private_key:   process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g,'\n'),
+    },
+    scopes: ['https://www.googleapis.com/auth/spreadsheets']
+  });
+  const client = await auth.getClient();
+  const sheets = google.sheets({ version: 'v4', auth: client });
 
-  const tags = (order?.tags || '').toString();
+  const cust    = order.customer || {};
+  const ship    = order.shipping_address || {};
+  const phone   = ship.phone || order.phone || cust.phone || '';
 
-  // Pénzügyi mezők több forrásból
-  const subtotal = order?.current_subtotal_price
-    ?? order?.subtotal_price
-    ?? order?.subtotal_price_set?.shop_money?.amount;
+  const items   = order.line_items || [];
+  const qty     = items.reduce((s,i)=> s + (i.quantity||0),0);
+  const names   = items.map(i=>i.title).join(';');
+  const skus    = items.map(i=>i.sku).join(';');
+  const vendors = items.map(i=>i.vendor).join(';');
 
-  const total = order?.current_total_price
-    ?? order?.total_price
-    ?? order?.total_price_set?.shop_money?.amount;
+  const addr = [ship.zip, ship.city, ship.address1, ship.address2]
+               .filter(Boolean).join('; ');
 
-  const tax = order?.current_total_tax
-    ?? order?.total_tax
-    ?? order?.total_tax_set?.shop_money?.amount;
+  // Replace decimal point with comma for Hungarian format
+  const subtotalHu = order.subtotal_price.replace('.', ',');
+  const totalHu    = order.total_price.replace('.', ',');
+  const taxHu      = order.total_tax.replace('.', ',');
 
-  const created = order?.created_at || order?.processed_at || new Date().toISOString();
-
-  return [
-    String(order?.id ?? ''),                             // A: Order ID
-    String(order?.name ?? ''),                           // B: Order name
-    formatHuDate(created),                               // C: Létrehozás (HU)
-    String(order?.currency ?? ''),                       // D: Deviza
-    formatDecimal(subtotal),                             // E: Subtotal
-    formatDecimal(tax),                                  // F: Tax
-    formatDecimal(total),                                // G: Total
-    String(order?.financial_status ?? ''),               // H
-    String(order?.fulfillment_status ?? ''),             // I
-    Number(safeLen(order?.line_items)),                  // J: Tételszám
-    String(payGateways),                                 // K
-    String(cust?.id ?? ''),                              // L: Customer ID
-    `${cust?.first_name ?? ''} ${cust?.last_name ?? ''}`.trim(), // M: Név
-    String(cust?.email ?? ''),                           // N: Email
-    String(ship?.city ?? ''),                            // O: Város
-    String(ship?.country ?? ''),                         // P: Ország
-    String(order?.note ?? ''),                           // Q: Megjegyzés
-    String(discountCodes),                               // R: Kuponok
-    String(tags),                                        // S: Tag-ek
-    formatHuDate(new Date().toISOString()),              // T: Rögzítés ideje (HU)
+  const row = [
+    order.id,
+    order.name,
+    cust.id||'',
+    [cust.first_name,cust.last_name].filter(Boolean).join(' '),
+    cust.email||'',
+    phone,
+    formatHuDate(order.created_at),
+    qty,
+    names,
+    skus,
+    vendors,
+    subtotalHu,
+    totalHu,
+    taxHu,
+    addr
   ];
-}
 
-async function findRowByOrderId(sheets, spreadsheetId, sheetName, orderId) {
-  const range = sheetRange(sheetName, 'A:A');
-  const resp = await withRetry(() => sheets.spreadsheets.values.get({
-    spreadsheetId,
-    range,
-    majorDimension: 'COLUMNS',
-  }));
-  const colA = resp.data?.values?.[0] || [];
-  const idx = colA.findIndex(v => String(v) === String(orderId));
-  return idx === -1 ? -1 : (idx + 1);
-}
-
-async function appendRowIfNotExists(sheets, spreadsheetId, sheetName, orderId, rowValues) {
-  const row = await findRowByOrderId(sheets, spreadsheetId, sheetName, orderId);
-  if (row !== -1) return { appended: false, row };
-
-  await withRetry(() => sheets.spreadsheets.values.append({
-    spreadsheetId,
-    range: sheetRange(sheetName, 'A1'),
-    valueInputOption: 'USER_ENTERED',
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: process.env.SPREADSHEET_ID,
+    range: `${process.env.SHEET_NAME}!A:T`, 
+    valueInputOption: 'USER_ENTERED',     
     insertDataOption: 'INSERT_ROWS',
-    resource: { values: [rowValues] },
-  }));
-
-  return { appended: true, row: null };
+    resource: { values: [ row ] }
+  });
 }
 
-async function updateCustomerMetafieldsIfEnabled(order) {
-  if (String(process.env.ENABLE_SHOPIFY_METAFIELDS).toLowerCase() !== 'true') return;
+app.post(
+  '/webhook/order-creation',
+  // ensure raw body for any content-type
+  express.raw({ type: '*/*', limit: '1mb' }),
+  async (req, res) => {
+    console.log('▶️ order-creation handler called, method:', req.method);
 
-  const custIdNum = order?.customer?.id;
-  if (!custIdNum) return;
-
-  const gid = `gid://shopify/Customer/${custIdNum}`;
-  const lastTotal = order?.current_total_price
-    ?? order?.total_price
-    ?? order?.total_price_set?.shop_money?.amount
-    ?? '0';
-
-  const lastDate  = order?.created_at || order?.processed_at || new Date().toISOString();
-
-  const mutation = `
-    mutation SetMetafields($metafields: [MetafieldsSetInput!]!) {
-      metafieldsSet(metafields: $metafields) {
-        metafields { id key namespace value }
-        userErrors { field message }
-      }
-    }
-  `;
-  const variables = {
-    metafields: [
-      { ownerId: gid, namespace: "loyalty", key: "last_order_total", type: "number_decimal", value: String(lastTotal) },
-      { ownerId: gid, namespace: "loyalty", key: "last_order_date",  type: "single_line_text_field", value: String(lastDate) },
-    ],
-  };
-
-  const data = await shopifyGQL(mutation, variables);
-  const errs = data?.metafieldsSet?.userErrors || [];
-  if (Array.isArray(errs) && errs.length) {
-    throw new Error(`Shopify metafield userErrors: ${JSON.stringify(errs)}`);
-  }
-}
-
-// ---- Handler (Vercel) ----
-module.exports = async (req, res) => {
-  try {
     if (req.method !== 'POST') {
-      res.setHeader('Allow', 'POST');
-      return sendJson(res, 405, { ok: false, error: 'Method Not Allowed' });
+      console.log('⚠️ Nem POST kérés érkezett');
+      return res.status(405).end('Method Not Allowed');
     }
 
-    // Több topicot is elfogadunk a biztonság kedvéért
-    requireShopAndTopic(req, ['orders/create', 'orders/paid']);
+    try {
+      if (!verifyShopifyWebhook(req)) {
+        console.log('❌ HMAC validation failed');
+        return res.status(401).end('Unauthorized');
+      }
 
-    // RAW body + HMAC
-    const raw = await getRawBody(req);
-    if (!verifyHmac(req, raw)) {
-      return sendJson(res, 401, { ok: false, error: 'Bad HMAC' });
+      const order = JSON.parse(req.body.toString('utf8'));
+      console.log(`▶️ Order ${order.id} received`);
+
+      // --- Metafield update ---
+      const shop      = process.env.SHOPIFY_SHOP_NAME;
+      const token     = process.env.SHOPIFY_API_ACCESS_TOKEN;
+      const shareUnit = Number(process.env.SHARE_UNIT);
+      const endpoint  = `https://${shop}.myshopify.com/admin/api/${process.env.SHOPIFY_API_VERSION}/graphql.json`;
+
+      const custGid = String(order.customer.id).split('/').pop();
+      console.log(`🆔 Customer GID: ${custGid}`);
+
+      // 1) Read existing metafields
+      const readRes = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type':'application/json','X-Shopify-Access-Token':token },
+        body: JSON.stringify({
+          query: `query getCustomer($id: ID!) { customer(id: $id) {
+            netSpent: metafield(namespace: "loyalty", key: "net_spent_total") { value }
+            sharesCount: metafield(namespace: "loyalty", key: "reszvenyek_szama") { value }
+            remainder: metafield(namespace: "custom", key: "jelenlegi_fennmarado") { value }
+          }}`,
+          variables: { id: `gid://shopify/Customer/${custGid}` }
+        })
+      });
+      const { data, errors } = await readRes.json();
+      if (errors?.length) throw errors;
+      const prevSpent     = parseFloat(data.customer.netSpent?.value || '0');
+      const prevShares    = parseInt(data.customer.sharesCount?.value || '0',10);
+      const prevRemainder = parseFloat(data.customer.remainder?.value || '0');
+      console.log(`PrevSpent:${prevSpent} Shares:${prevShares}`);
+
+      // 2) Compute new values
+      const subtotal     = parseFloat(order.subtotal_price);
+      const newTotal     = prevSpent + subtotal;
+      const totalShares  = Math.floor(newTotal / shareUnit);
+      const earnedShares = totalShares - prevShares;
+      const newRemainder = newTotal % shareUnit;
+      console.log(`Earned:${earnedShares} NewRemainder:${newRemainder}`);
+
+      // 3) Mutate
+      const mutation = `mutation updateBoth($custInput: CustomerInput!, $orderInput: OrderInput!) {
+        customerUpdate(input: $custInput) { userErrors { field message } }
+        orderUpdate(input: $orderInput) { userErrors { field message } }
+      }`;
+      const variables = {
+        custInput: {
+          id: `gid://shopify/Customer/${custGid}`,
+          metafields: [
+            { namespace:'loyalty', key:'net_spent_total', type:'number_decimal', value:newTotal.toFixed(2) },
+            { namespace:'loyalty', key:'reszvenyek_szama', type:'number_integer', value:totalShares.toString() },
+            { namespace:'custom',  key:'jelenlegi_fennmarado', type:'number_decimal', value:newRemainder.toFixed(2) }
+          ]
+        },
+        orderInput: {
+          id: `gid://shopify/Order/${order.id}`,
+          metafields: [
+            { namespace:'custom', key:'subtotal', type:'number_decimal', value:subtotal.toFixed(2) },
+            { namespace:'custom', key:'order_share', type:'number_integer', value:earnedShares.toString() },
+            { namespace:'custom', key:'order_remainder', type:'number_decimal', value:newRemainder.toFixed(2) }
+          ]
+        }
+      };
+      const mutRes = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type':'application/json','X-Shopify-Access-Token':token },
+        body: JSON.stringify({ query: mutation, variables })
+      });
+      const mutJson = await mutRes.json();
+      const custErrs  = mutJson.data.customerUpdate.userErrors;
+      const orderErrs = mutJson.data.orderUpdate.userErrors;
+      if (custErrs.length || orderErrs.length) {
+        console.error('Mutation errors', custErrs, orderErrs);
+        return res.status(500).end('Metafield update failed');
+      }
+      console.log('✅ Metafields updated');
+
+      // 4) Sheet write
+      await appendOrderToSheet(order);
+      console.log('✅ Sheet updated');
+
+      res.status(200).end('OK');
+    } catch (err) {
+      console.error('🔥 Unexpected error in webhook handler:', err);
+      res.status(500).end('Internal Server Error');
     }
-
-    const order = JSON.parse(raw.toString('utf8'));
-
-    const sheets = await getSheets();
-    const spreadsheetId = process.env.SPREADSHEET_ID;
-    const sheetName = process.env.SHEET_NAME;
-
-    const rowValues = buildRowFromOrder(order);
-    const result = await appendRowIfNotExists(sheets, spreadsheetId, sheetName, order.id, rowValues);
-
-    // Opcionális Shopify metafield frissítés (nem blokkol)
-    await updateCustomerMetafieldsIfEnabled(order).catch(err => {
-      console.error('[metafieldsSet] hiba:', err.message || err);
-    });
-
-    return sendJson(res, 200, { ok: true, appended: result.appended, row: result.row });
-  } catch (err) {
-    console.error(err);
-    const code = err.status || err.code || 500;
-    return sendJson(res, code, { ok: false, error: err.message || 'Internal Server Error' });
   }
-};
+);
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`🚀 Listening on ${PORT}`));
