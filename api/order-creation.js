@@ -1,34 +1,35 @@
 'use strict';
 
 /**
- * orders/create webhook feldolgozása:
- * - HMAC + shop/topic header ellenőrzés
- * - Idempotens sor-hozzáadás Google Sheets-be (A:T példastruktúra)
- * - Opcionális Shopify metafield frissítés (ENABLE_SHOPIFY_METAFIELDS=true esetén)
+ * Vercel szerverless handler (orders/create):
+ * - Nyers body olvasás + HMAC
+ * - Shop/topic guard
+ * - Idempotens sor hozzáfűzés Google Sheets-hez
+ * - (Opcionális) Shopify metafield frissítés
  */
 
 require('dotenv').config();
-const express = require('express');
-const router = express.Router();
 
 const {
-  rawJson,
+  getRawBody,
   verifyHmac,
   requireShopAndTopic,
+  sendJson,
   getSheets,
   sheetRange,
   formatHuDate,
   formatDecimal,
   shopifyGQL,
-  asyncHandler,
   withRetry,
   requireEnv,
 } = require('./utils');
 
-// Sheet env-ek – nálad: SHEET_NAME = "Rendelések", SPREADSHEET_ID = "..."
 requireEnv(['SPREADSHEET_ID', 'SHEET_NAME']);
 
-// --- Segédfüggvények csak ehhez a végponthoz ---
+// Next.js API alatt ez kell a raw body-hoz:
+module.exports.config = { api: { bodyParser: false } };
+
+// --- Segédfüggvények ---
 function buildRowFromOrder(order) {
   const cust = order.customer || {};
   const ship = order.shipping_address || {};
@@ -50,25 +51,25 @@ function buildRowFromOrder(order) {
 
   return [
     String(order.id ?? ''),                     // A: Order ID
-    String(order.name ?? ''),                   // B: Order name
-    formatHuDate(created),                      // C: Létrehozás (HU)
-    String(order.currency ?? ''),               // D: Deviza
-    formatDecimal(subtotal),                    // E: Subtotal
-    formatDecimal(tax),                         // F: Tax
-    formatDecimal(total),                       // G: Total
+    String(order.name ?? ''),                   // B
+    formatHuDate(created),                      // C
+    String(order.currency ?? ''),               // D
+    formatDecimal(subtotal),                    // E
+    formatDecimal(tax),                         // F
+    formatDecimal(total),                       // G
     String(order.financial_status ?? ''),       // H
     String(order.fulfillment_status ?? ''),     // I
     Number(order.line_items?.length || 0),      // J
     String(payGateways),                        // K
     String(cust.id ?? ''),                      // L: Customer ID
     `${cust.first_name ?? ''} ${cust.last_name ?? ''}`.trim(), // M: Név
-    String(cust.email ?? ''),                   // N: Email
-    String(ship.city ?? ''),                    // O: Város
-    String(ship.country ?? ''),                 // P: Ország
-    String(order.note ?? ''),                   // Q: Megjegyzés
-    String(discountCodes),                      // R: Kuponok
-    String(tags),                               // S: Tag-ek
-    formatHuDate(new Date().toISOString()),     // T: Rögzítés ideje (HU)
+    String(cust.email ?? ''),                   // N
+    String(ship.city ?? ''),                    // O
+    String(ship.country ?? ''),                 // P
+    String(order.note ?? ''),                   // Q
+    String(discountCodes),                      // R
+    String(tags),                               // S
+    formatHuDate(new Date().toISOString()),     // T
   ];
 }
 
@@ -130,24 +131,40 @@ async function updateCustomerMetafieldsIfEnabled(order) {
   }
 }
 
-// --- Végpont ---
-router.post('/api/order-creation', rawJson, asyncHandler(async (req, res) => {
-  requireShopAndTopic(req, 'orders/create');
-  if (!verifyHmac(req, req.body)) return res.status(401).send('Bad HMAC');
+// ---- Handler (Vercel) ----
+module.exports = async (req, res) => {
+  try {
+    if (req.method !== 'POST') {
+      res.setHeader('Allow', 'POST');
+      return sendJson(res, 405, { ok: false, error: 'Method Not Allowed' });
+    }
 
-  const order = JSON.parse(req.body.toString('utf8'));
-  const sheets = await getSheets();
-  const spreadsheetId = process.env.SPREADSHEET_ID;
-  const sheetName = process.env.SHEET_NAME;
+    // Header guardok
+    requireShopAndTopic(req, 'orders/create');
 
-  const rowValues = buildRowFromOrder(order);
-  const result = await appendRowIfNotExists(sheets, spreadsheetId, sheetName, order.id, rowValues);
+    // RAW body + HMAC
+    const raw = await getRawBody(req);
+    if (!verifyHmac(req, raw)) {
+      return sendJson(res, 401, { ok: false, error: 'Bad HMAC' });
+    }
 
-  await updateCustomerMetafieldsIfEnabled(order).catch(err => {
-    console.error('[metafieldsSet] hiba:', err.message || err);
-  });
+    const order = JSON.parse(raw.toString('utf8'));
 
-  res.status(200).json({ ok: true, appended: result.appended, row: result.row });
-}));
+    const sheets = await getSheets();
+    const spreadsheetId = process.env.SPREADSHEET_ID;
+    const sheetName = process.env.SHEET_NAME;
 
-module.exports = router;
+    const rowValues = buildRowFromOrder(order);
+    const result = await appendRowIfNotExists(sheets, spreadsheetId, sheetName, order.id, rowValues);
+
+    await updateCustomerMetafieldsIfEnabled(order).catch(err => {
+      console.error('[metafieldsSet] hiba:', err.message || err);
+    });
+
+    return sendJson(res, 200, { ok: true, appended: result.appended, row: result.row });
+  } catch (err) {
+    console.error(err);
+    const code = err.status || err.code || 500;
+    return sendJson(res, code, { ok: false, error: err.message || 'Internal Server Error' });
+  }
+};

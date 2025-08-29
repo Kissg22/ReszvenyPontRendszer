@@ -1,16 +1,19 @@
 'use strict';
 
 /**
- * Közös utilok: HMAC, raw body middleware, Google Sheets singleton,
- * Shopify GraphQL kliens (verzió normalizálással), HU dátum/decimális formázás,
- * asyncHandler, retry, shop/topic guard, és Sheet-név idézőjelezés A1-hez.
+ * Vercel/Next API kompatibilis utilok:
+ * - getRawBody(req) nyers body-hoz (HMAC)
+ * - verifyHmac, requireShopAndTopic
+ * - Google Sheets singleton kliens
+ * - Shopify GraphQL kliens (API ver. normalizálás)
+ * - HU dátum/decimális formázók
+ * - withRetry, requireEnv, sheetRange
  */
 
-const express = require('express');
 const crypto = require('crypto');
 const { google } = require('googleapis');
 
-// --- Env ellenőrzés (kritikus kulcsok) ---
+// ---- Env ellenőrzés (kritikus kulcsok) ----
 function requireEnv(keys) {
   const missing = keys.filter(k => !(process.env[k] || '').trim());
   if (missing.length) {
@@ -19,10 +22,20 @@ function requireEnv(keys) {
 }
 requireEnv(['SHOPIFY_API_SECRET_KEY', 'GOOGLE_CLIENT_EMAIL', 'GOOGLE_PRIVATE_KEY']);
 
-// --- Raw JSON (Shopify webhookhoz nyers body kell a HMAC-hez) ---
-const rawJson = express.raw({ type: 'application/json' });
+// ---- Nyers body olvasása (Vercel/Next API) ----
+async function getRawBody(req) {
+  // Ha már buffer
+  if (req.body && Buffer.isBuffer(req.body)) return req.body;
 
-// --- HMAC ellenőrzés ---
+  // Next API bodyParser kikapcsolása esetén jellemzően streamet kapunk:
+  const chunks = [];
+  for await (const chunk of req) {
+    chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+// ---- HMAC ellenőrzés Shopify-hoz ----
 function verifyHmac(req, rawBody) {
   const secret = (process.env.SHOPIFY_API_SECRET_KEY || '').trim();
   const received = (req.headers['x-shopify-hmac-sha256'] || '').toString();
@@ -35,7 +48,7 @@ function verifyHmac(req, rawBody) {
   return crypto.timingSafeEqual(a, b);
 }
 
-// --- Shop & Topic guard (opcionális, de ajánlott) ---
+// ---- Shop & Topic guard (opcionális) ----
 function requireShopAndTopic(req, expectedTopic) {
   const shopHeader = (req.headers['x-shopify-shop-domain'] || '').toString();
   const topicHeader = (req.headers['x-shopify-topic'] || '').toString();
@@ -53,20 +66,18 @@ function requireShopAndTopic(req, expectedTopic) {
   }
 }
 
-// --- Google Private Key normalizálás ---
+// ---- Google Private Key normalizálás ----
 function normalizeGooglePrivateKey(raw) {
   let key = (raw || '').trim();
   if (!key) return key;
-  // Ha egy sorban van '\\n'-ekkel:
   if (key.includes('\\n')) key = key.replace(/\\n/g, '\n');
-  // Ha nincs PEM header/footer, pótoljuk:
   if (!/BEGIN PRIVATE KEY/.test(key)) {
     key = `-----BEGIN PRIVATE KEY-----\n${key}\n-----END PRIVATE KEY-----\n`;
   }
   return key;
 }
 
-// --- Google Sheets kliens (singleton) ---
+// ---- Google Sheets kliens (singleton) ----
 let _sheets = null;
 async function getSheets() {
   if (_sheets) return _sheets;
@@ -80,23 +91,22 @@ async function getSheets() {
   return _sheets;
 }
 
-// --- SHOPIFY API VERSION normalizálás ('2025.04.01' -> '2025-04') ---
+// ---- Shopify API version normalizálás ('2025.04.01' -> '2025-04') ----
 function normalizeShopifyApiVersion(verRaw) {
   const v = (verRaw || '').trim();
   if (!v) return v;
-  // Fogd meg az első "YYYY" és utána "MM" részt
   const m = v.match(/(\d{4})[.\-_/]?(\d{2})/);
   if (m) return `${m[1]}-${m[2]}`;
-  return v; // fallback
+  return v;
 }
 
-// --- Fetch fallback (Node18 alatt van globális fetch, különben node-fetch dinamikus import) ---
+// ---- Fetch (Node18+ globális, különben node-fetch) ----
 const doFetch = (...args) =>
   (typeof fetch !== 'undefined'
     ? fetch(...args)
     : import('node-fetch').then(m => m.default(...args)));
 
-// --- Shopify GraphQL kliens ---
+// ---- Shopify GraphQL kliens ----
 function createShopifyGraphQL() {
   const shop = (process.env.SHOPIFY_SHOP_NAME || '').trim();
   const token = (process.env.SHOPIFY_API_ACCESS_TOKEN || '').trim();
@@ -127,16 +137,15 @@ function createShopifyGraphQL() {
 }
 const shopifyGQL = createShopifyGraphQL();
 
-// --- Sheet-név idézőjelezése A1 hivatkozáshoz ---
+// ---- Sheet-név A1 idézés ----
 function escapeSheetName(name) {
-  // Egy aposztróf a névben -> két aposztróf
   return String(name).replace(/'/g, "''");
 }
 function sheetRange(sheetName, a1Tail) {
   return `'${escapeSheetName(sheetName)}'!${a1Tail}`;
 }
 
-// --- Formázók ---
+// ---- Formázók ----
 function formatHuDate(iso) {
   const d = iso instanceof Date ? iso : new Date(iso);
   const parts = new Intl.DateTimeFormat('hu-HU', {
@@ -155,14 +164,7 @@ function formatDecimal(x) {
   return nfHu2.format(safe);
 }
 
-// --- asyncHandler és withRetry ---
-const asyncHandler = fn => (req, res, next) =>
-  Promise.resolve(fn(req, res, next)).catch(err => {
-    console.error(err);
-    const code = err.status || err.code || 500;
-    res.status(code >= 400 && code < 600 ? code : 500).send(err.message || 'Internal Server Error');
-  });
-
+// ---- Retry helper ----
 async function withRetry(fn, tries = 3) {
   let last;
   for (let i = 0; i < tries; i++) {
@@ -178,11 +180,19 @@ async function withRetry(fn, tries = 3) {
   throw last;
 }
 
+// ---- JSON válasz küldése (Vercel/micro kompatibilis) ----
+function sendJson(res, statusCode, obj) {
+  res.statusCode = statusCode;
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.end(JSON.stringify(obj));
+}
+
 module.exports = {
-  // middlewares & guards
-  rawJson,
+  // request helpers
+  getRawBody,
   verifyHmac,
   requireShopAndTopic,
+  sendJson,
 
   // sheets & shopify
   getSheets,
@@ -196,7 +206,6 @@ module.exports = {
   formatDecimal,
 
   // helpers
-  asyncHandler,
   withRetry,
   requireEnv,
 };

@@ -1,33 +1,32 @@
 'use strict';
 
 /**
- * orders/updated webhook feldolgozása:
- * - HMAC + shop/topic guard
- * - Meglévő sor megkeresése (A oszlop: order.id)
- * - L:N frissítése (subtotal, total, tax) + O oszlopban módosítási jegyzet
- *   (Igazítsd, ha más az oszlop-sorrend a tábládban.)
+ * Vercel szerverless handler (orders/updated):
+ * - Nyers body + HMAC
+ * - Shop/topic guard
+ * - Sor megkeresése (A oszlopban order.id)
+ * - L:N frissítése (subtotal, total, tax) + O oszlop (módosítási jegyzet)
  */
 
 require('dotenv').config();
-const express = require('express');
-const router = express.Router();
 
 const {
-  rawJson,
+  getRawBody,
   verifyHmac,
   requireShopAndTopic,
+  sendJson,
   getSheets,
   sheetRange,
   formatHuDate,
   formatDecimal,
-  asyncHandler,
   withRetry,
   requireEnv,
 } = require('./utils');
 
 requireEnv(['SPREADSHEET_ID', 'SHEET_NAME']);
+module.exports.config = { api: { bodyParser: false } };
 
-// --- Segédek ---
+// --- Segédfüggvények ---
 async function findRowByOrderId(sheets, spreadsheetId, sheetName, orderId) {
   const range = sheetRange(sheetName, 'A:A');
   const resp = await withRetry(() => sheets.spreadsheets.values.get({
@@ -65,46 +64,61 @@ function extractAdjustData(order) {
   return { subtotal, total, tax, note };
 }
 
-// --- Végpont ---
-router.post('/api/order-adjust', rawJson, asyncHandler(async (req, res) => {
-  requireShopAndTopic(req, 'orders/updated');
-  if (!verifyHmac(req, req.body)) return res.status(401).send('Bad HMAC');
+// ---- Handler (Vercel) ----
+module.exports = async (req, res) => {
+  try {
+    if (req.method !== 'POST') {
+      res.setHeader('Allow', 'POST');
+      return sendJson(res, 405, { ok: false, error: 'Method Not Allowed' });
+    }
 
-  const order = JSON.parse(req.body.toString('utf8'));
-  const orderId = order.id;
-  if (!orderId) return res.status(400).send('Hiányzó order.id');
+    requireShopAndTopic(req, 'orders/updated');
 
-  const sheets = await getSheets();
-  const spreadsheetId = process.env.SPREADSHEET_ID;
-  const sheetName = process.env.SHEET_NAME;
+    const raw = await getRawBody(req);
+    if (!verifyHmac(req, raw)) {
+      return sendJson(res, 401, { ok: false, error: 'Bad HMAC' });
+    }
 
-  const row = await findRowByOrderId(sheets, spreadsheetId, sheetName, orderId);
-  if (row === -1) return res.status(404).send(`Order ID nem található a táblában: ${orderId}`);
+    const order = JSON.parse(raw.toString('utf8'));
+    const orderId = order.id;
+    if (!orderId) return sendJson(res, 400, { ok: false, error: 'Hiányzó order.id' });
 
-  const { subtotal, total, tax, note } = extractAdjustData(order);
-  const noteCellValue = `módosítva: ${formatHuDate(new Date().toISOString())}${note ? ` – ${note}` : ''}`;
+    const sheets = await getSheets();
+    const spreadsheetId = process.env.SPREADSHEET_ID;
+    const sheetName = process.env.SHEET_NAME;
 
-  await withRetry(() => sheets.spreadsheets.values.batchUpdate({
-    spreadsheetId,
-    resource: {
-      valueInputOption: 'USER_ENTERED',
-      data: [
-        { range: sheetRange(sheetName, `L${row}:N${row}`), values: [[formatDecimal(subtotal), formatDecimal(total), formatDecimal(tax)]] },
-        { range: sheetRange(sheetName, `O${row}`),         values: [[noteCellValue]] },
-      ],
-    },
-  }));
+    const row = await findRowByOrderId(sheets, spreadsheetId, sheetName, orderId);
+    if (row === -1) {
+      return sendJson(res, 404, { ok: false, error: `Order ID nem található a táblában: ${orderId}` });
+    }
 
-  res.status(200).json({
-    ok: true,
-    row,
-    updated: {
-      subtotal: formatDecimal(subtotal),
-      total: formatDecimal(total),
-      tax: formatDecimal(tax),
-      note: noteCellValue,
-    },
-  });
-}));
+    const { subtotal, total, tax, note } = extractAdjustData(order);
+    const noteCellValue = `módosítva: ${formatHuDate(new Date().toISOString())}${note ? ` – ${note}` : ''}`;
 
-module.exports = router;
+    await withRetry(() => sheets.spreadsheets.values.batchUpdate({
+      spreadsheetId,
+      resource: {
+        valueInputOption: 'USER_ENTERED',
+        data: [
+          { range: sheetRange(sheetName, `L${row}:N${row}`), values: [[formatDecimal(subtotal), formatDecimal(total), formatDecimal(tax)]] },
+          { range: sheetRange(sheetName, `O${row}`),         values: [[noteCellValue]] },
+        ],
+      },
+    }));
+
+    return sendJson(res, 200, {
+      ok: true,
+      row,
+      updated: {
+        subtotal: formatDecimal(subtotal),
+        total: formatDecimal(total),
+        tax: formatDecimal(tax),
+        note: noteCellValue,
+      },
+    });
+  } catch (err) {
+    console.error(err);
+    const code = err.status || err.code || 500;
+    return sendJson(res, code, { ok: false, error: err.message || 'Internal Server Error' });
+  }
+};
